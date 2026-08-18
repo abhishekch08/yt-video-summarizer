@@ -1,6 +1,6 @@
 # Video Summary
 
-A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase Free, with OpenAI as the only paid API.
+A private, mobile-first YouTube summarizer designed to run entirely on free service tiers.
 
 ## What it does
 
@@ -8,7 +8,7 @@ A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase 
 - Processes videos **one at a time**.
 - Retrieves creator or auto-generated captions first.
 - Aggressively cleans caption noise without intentionally changing meaning.
-- If captions are unavailable, downloads audio in small time windows and transcribes each window with OpenAI.
+- If Vercel cannot fetch YouTube's caption body directly, uses Supadata's free transcript allowance.
 - Streams an English summary live in a ChatGPT-like dark UI.
 - Summary structure adapts to technical, finance, tutorial, interview, news, educational, or general content.
 - Summary depth: **Concise / Standard / Detailed**; Standard is default.
@@ -25,11 +25,10 @@ A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase 
 - Next.js 16 / React 19
 - Vercel Hobby
 - Supabase Free Postgres
-- OpenAI Responses API (`gpt-5-mini` by default)
-- `gpt-5-nano` for cheap content classification
-- `gpt-4o-mini-transcribe` for audio fallback
-- `youtubei.js` + bundled `ffmpeg-static` for chunked audio extraction
-- optional authenticated proxy egress for cloud IPs that YouTube restricts
+- Gemini API free tier (`gemini-2.5-flash` by default)
+- `gemini-2.5-flash-lite` for free content classification
+- Supadata free tier for transcript fallback
+- `youtubei.js` for direct captions, metadata, and playlists
 
 ## 1. Create Supabase project
 
@@ -53,7 +52,8 @@ npm run dev
 Set these values in `.env.local`:
 
 ```text
-OPENAI_API_KEY=...
+GEMINI_API_KEY=...
+SUPADATA_API_KEY=...
 APP_PIN=...
 SESSION_SECRET=...
 SUPABASE_URL=...
@@ -80,30 +80,19 @@ Use the Cookie header from a YouTube/Google account that is already authorized t
 
 Important: no application can access a private/member video if the YouTube account represented by the cookie is not authorized to view it. YouTube can also block cloud-hosted extraction traffic or change undocumented interfaces; the app reports these failures rather than hiding them.
 
-### Vercel / cloud egress
+### Free transcript fallback
 
-YouTube can advertise a caption track or return video metadata while withholding the
-caption body and media streams from a cloud-hosted IP. If that happens, configure a
-trusted HTTP(S) proxy whose egress can reach YouTube:
-
-```text
-YOUTUBE_PROXY_URL=http://username:password@proxy-host:port
-```
-
-The same proxy is used for player metadata, captions, playlists, and FFmpeg audio
-requests. Store it only in Vercel environment variables. The app redacts the proxy and
-signed media URLs from user-facing conversion errors.
-
-For reliable production use, use a private authenticated proxy. Public/free proxies are
-not appropriate because transcripts, cookies, and signed media requests would pass
-through that operator.
+YouTube sometimes advertises captions while withholding their body from Vercel's cloud
+IP addresses. The app first tries YouTube directly, then calls Supadata in `auto` mode.
+Create a free Supadata account and keep `SUPADATA_API_KEY` only in server-side environment
+variables. The free plan has a monthly credit allowance; the application never purchases
+credits or switches to a paid proxy.
 
 ## 4. Deploy on Vercel
 
 1. Push this folder to a GitHub repository.
 2. In Vercel choose **Add New → Project** and import that repository.
 3. Add all required variables from `.env.example` under **Project Settings → Environment Variables**.
-   Add `YOUTUBE_PROXY_URL` as well if Vercel's direct egress is restricted by YouTube.
 4. Enable **Fluid Compute** for the project if it is not already enabled.
 5. Deploy.
 
@@ -119,30 +108,29 @@ The heavy API routes specify a 300-second maximum duration, matching the current
 
 Supabase Free currently provides a 500 MB database. For personal use this should be adequate for a substantial summary library, but raw transcripts are deliberately expired because they are the largest persistent objects.
 
-## Long videos
+## Free-tier limits
 
-Captioned videos are cheap and efficient because only text is processed.
-
-No-caption videos are split into 8-minute audio windows. Each window is handled by a separate Vercel request and transcribed independently, which prevents one very long video from requiring a single multi-hour server process. The UI processes those windows sequentially and shows progress.
-
-A chunk can still fail because of YouTube throttling, authentication, network conditions, Vercel execution limits, or OpenAI/API errors. The app returns a specific error in the queue instead of freezing.
+The stack does not require billing details, but free tiers are not unlimited. Supadata
+currently grants a monthly transcript credit allowance, and Gemini applies per-project
+request/token limits. When a quota is exhausted the app reports that condition and stops;
+it does not make a paid request. Long videos without native captions consume more
+Supadata credits because the service must generate a transcript.
 
 ## Models
 
 Models are environment-configurable:
 
 ```text
-OPENAI_SUMMARY_MODEL=gpt-5-mini
-OPENAI_CLASSIFIER_MODEL=gpt-5-nano
-OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+GEMINI_SUMMARY_MODEL=gemini-2.5-flash
+GEMINI_CLASSIFIER_MODEL=gemini-2.5-flash-lite
 ```
 
-No code change is needed if you want to swap to another compatible OpenAI model later.
+No code change is needed if you want to swap to another compatible Gemini model later.
 
 ## Security notes
 
 - Never commit `.env.local`.
-- Never expose `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `APP_PIN`, `SESSION_SECRET`, or `YOUTUBE_COOKIE` in client code.
+- Never expose `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `SUPADATA_API_KEY`, `APP_PIN`, `SESSION_SECRET`, or `YOUTUBE_COOKIE` in client code.
 - Use a long, non-obvious PIN/password even though the UI calls it a PIN.
 - The session cookie is HTTP-only, SameSite=Lax, and Secure in production.
 - RLS is enabled on both Supabase tables with no public policies; server service-role access is used instead.

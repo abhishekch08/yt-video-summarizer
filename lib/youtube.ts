@@ -1,5 +1,4 @@
 import { Innertube, UniversalCache } from 'youtubei.js';
-import { ProxyAgent, type Dispatcher } from 'undici';
 import { env } from '@/lib/env';
 import { cleanTranscript, decodeHtml } from '@/lib/text';
 
@@ -20,37 +19,22 @@ export interface CaptionResult {
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
 
 class CaptionAccessError extends Error {
-  constructor(message: string, readonly diagnostics: string[]) {
+  constructor(
+    message: string,
+    readonly diagnostics: string[],
+    readonly metadata?: YoutubeMetadata,
+  ) {
     super(message);
     this.name = 'CaptionAccessError';
   }
 }
 
-let proxyAgent: ProxyAgent | null | undefined;
-
-function getProxyAgent() {
-  if (proxyAgent !== undefined) return proxyAgent;
-  proxyAgent = env.youtubeProxyUrl ? new ProxyAgent(env.youtubeProxyUrl) : null;
-  return proxyAgent;
-}
-
 function youtubeFetch(input: string | URL | Request, init?: RequestInit) {
-  const dispatcher = getProxyAgent();
-  if (!dispatcher) return fetch(input, init);
-  return fetch(input, { ...init, dispatcher } as RequestInit & { dispatcher: Dispatcher });
+  return fetch(input, init);
 }
 
 function safeErrorMessage(error: unknown) {
-  let message = error instanceof Error ? error.message : String(error);
-  const proxyUrl = env.youtubeProxyUrl;
-  if (proxyUrl) message = message.replaceAll(proxyUrl, '[proxy]');
-  return message;
-}
-
-function proxyHint() {
-  return env.youtubeProxyUrl
-    ? ' The configured YouTube proxy was also unable to complete the request.'
-    : ' Configure YOUTUBE_PROXY_URL with a trusted proxy whose egress is not blocked by YouTube.';
+  return error instanceof Error ? error.message : String(error);
 }
 
 function requestHeaders() {
@@ -173,7 +157,7 @@ async function fetchCaptionText(baseUrl: string) {
   }
 
   throw new CaptionAccessError(
-    `YouTube advertised captions for this video but did not return the caption text.${proxyHint()}`,
+    'YouTube advertised captions for this video but did not return the caption text.',
     diagnostics,
   );
 }
@@ -271,8 +255,9 @@ async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
   if (failures.some((failure) => failure.includes('captions:'))) {
     console.error(`[youtube-captions] video=${videoId}`, failures);
     throw new CaptionAccessError(
-      `YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`,
+      'YouTube captions were detected but could not be fetched from this deployment.',
       failures,
+      fallbackMetadata || undefined,
     );
   }
 
@@ -305,8 +290,106 @@ async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
 
   const track = selectCaptionTrack(tracks);
   if (!track?.baseUrl) return { metadata, transcript: null };
-  const transcript = await fetchCaptionText(track.baseUrl);
-  return { metadata, transcript: transcript || null, captionLanguage: track.languageCode };
+  try {
+    const transcript = await fetchCaptionText(track.baseUrl);
+    return { metadata, transcript: transcript || null, captionLanguage: track.languageCode };
+  } catch (error) {
+    if (error instanceof CaptionAccessError) {
+      throw new CaptionAccessError(error.message, error.diagnostics, metadata);
+    }
+    throw error;
+  }
+}
+
+type SupadataTranscript = {
+  content?: string | Array<{ text?: string }>;
+  lang?: string;
+  jobId?: string;
+  status?: 'queued' | 'active' | 'completed' | 'failed';
+  error?: unknown;
+  result?: SupadataTranscript;
+};
+
+function supadataError(status: number, body: unknown) {
+  if (status === 401) return new Error('SUPADATA_API_KEY is missing or invalid. Create a free Supadata key and add it to Vercel.');
+  if (status === 429) return new Error('The free Supadata request limit was reached. It will reset with the free plan quota.');
+  if (status === 402) return new Error('The free Supadata credit allowance is exhausted. No paid fallback was attempted.');
+  if (status === 206) return new Error('No existing captions were available and the free transcript service could not produce a transcript.');
+  const value = body as any;
+  const detail = value?.error?.message || value?.error?.details || value?.message;
+  return new Error(`Free transcript fallback failed (HTTP ${status})${detail ? `: ${String(detail)}` : '.'}`);
+}
+
+function transcriptFromSupadata(body: SupadataTranscript) {
+  const value = body.result || body;
+  const content = value.content;
+  if (typeof content === 'string') return cleanTranscript(content);
+  if (Array.isArray(content)) return cleanTranscript(content.map((part) => part.text || ''));
+  return '';
+}
+
+async function supadataRequest(url: string) {
+  const response = await fetch(url, {
+    headers: { 'x-api-key': env.supadataApiKey, accept: 'application/json' },
+    cache: 'no-store',
+  });
+  const body = await response.json().catch(() => ({})) as SupadataTranscript;
+  if (response.status === 206 || !response.ok) throw supadataError(response.status, body);
+  return { response, body };
+}
+
+async function fetchFreeTranscript(inputUrl: string) {
+  const url = new URL('https://api.supadata.ai/v1/transcript');
+  url.searchParams.set('url', inputUrl);
+  url.searchParams.set('lang', 'en');
+  url.searchParams.set('text', 'true');
+  url.searchParams.set('mode', 'auto');
+
+  const { response, body } = await supadataRequest(url.toString());
+  let result = body;
+
+  if (response.status === 202 || body.jobId) {
+    if (!body.jobId) throw new Error('The free transcript service started a job without returning its ID.');
+    const deadline = Date.now() + 240_000;
+    const jobUrl = `https://api.supadata.ai/v1/transcript/${encodeURIComponent(body.jobId)}`;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const polled = await supadataRequest(jobUrl);
+      result = polled.body;
+      if (result.status === 'failed') throw new Error('The free transcript service could not process this video.');
+      if (result.status === 'completed') break;
+    }
+    if (result.status !== 'completed') throw new Error('The free transcript service did not finish before the deployment timeout.');
+  }
+
+  const transcript = transcriptFromSupadata(result);
+  if (!transcript) throw new Error('The free transcript service returned an empty transcript.');
+  return { transcript, language: (result.result || result).lang };
+}
+
+async function fetchOEmbedMetadata(inputUrl: string, videoId: string): Promise<YoutubeMetadata> {
+  try {
+    const url = new URL('https://www.youtube.com/oembed');
+    url.searchParams.set('url', inputUrl);
+    url.searchParams.set('format', 'json');
+    const response = await fetch(url, { cache: 'no-store' });
+    const body = response.ok ? await response.json() as any : null;
+    return {
+      videoId,
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      title: body?.title || `YouTube video ${videoId}`,
+      channel: body?.author_name || null,
+      durationSeconds: null,
+    };
+  } catch {
+    return {
+      videoId,
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      title: `YouTube video ${videoId}`,
+      channel: null,
+      durationSeconds: null,
+    };
+  }
 }
 
 export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<CaptionResult> {
@@ -322,59 +405,35 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
     innerError = error;
   }
 
+  let pageResult: CaptionResult | null = null;
+  let pageError: unknown = null;
   try {
-    const pageResult = await fetchViaWatchPage(videoId);
+    pageResult = await fetchViaWatchPage(videoId);
     if (pageResult.transcript) return pageResult;
-    return innerResult || pageResult;
-  } catch (pageError) {
-    if (pageError instanceof CaptionAccessError) {
-      console.error(`[youtube-captions-page] video=${videoId}`, pageError.diagnostics);
-    }
-    if (innerError instanceof CaptionAccessError || pageError instanceof CaptionAccessError) {
-      throw new Error(`YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`);
-    }
-    if (innerResult) return innerResult;
-
-    const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
-    const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
-    throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
-  }
-}
-
-export async function fetchAudioFormat(videoUrl: string) {
-  const videoId = extractYoutubeId(videoUrl);
-  if (!videoId) throw new Error('Invalid YouTube video URL');
-  const youtube = await getYoutubeClient();
-
-  // YouTube increasingly applies different playback requirements to different InnerTube
-  // clients. A normal WEB metadata request can succeed while its streamingData is omitted.
-  // Retry a small set of official clients before treating the video as non-downloadable.
-  const clients = ['IOS', 'ANDROID_VR', 'TV', 'WEB_EMBEDDED', 'WEB'] as const;
-  const failures: string[] = [];
-
-  for (const client of clients) {
-    try {
-      const format: any = await youtube.getStreamingData(videoId, {
-        type: 'audio',
-        quality: 'best',
-        client,
-      } as any);
-      if (format?.url) {
-        return {
-          url: format.url,
-          mimeType: format.mime_type || 'audio/webm',
-          durationSeconds: null,
-        };
-      }
-      failures.push(`${client}: no URL`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      failures.push(`${client}: ${message}`);
+  } catch (error) {
+    pageError = error;
+    if (error instanceof CaptionAccessError) {
+      console.error(`[youtube-captions-page] video=${videoId}`, error.diagnostics);
     }
   }
 
-  console.error(`[youtube-audio] video=${videoId}`, failures);
-  throw new Error(`YouTube did not provide a downloadable audio stream to this deployment.${proxyHint()}`);
+  const metadata = innerResult?.metadata
+    || pageResult?.metadata
+    || (innerError instanceof CaptionAccessError ? innerError.metadata : undefined)
+    || (pageError instanceof CaptionAccessError ? pageError.metadata : undefined)
+    || await fetchOEmbedMetadata(inputUrl, videoId);
+
+  try {
+    const fallback = await fetchFreeTranscript(metadata.url);
+    return { metadata, transcript: fallback.transcript, captionLanguage: fallback.language };
+  } catch (error) {
+    const directFailures = [innerError, pageError]
+      .filter(Boolean)
+      .map((failure) => safeErrorMessage(failure))
+      .join(' | ');
+    console.error(`[free-transcript] video=${videoId}`, { directFailures, fallback: safeErrorMessage(error) });
+    throw error;
+  }
 }
 
 function walkForPlaylistIds(node: unknown, out: string[]) {

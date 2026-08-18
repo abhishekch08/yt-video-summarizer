@@ -23,11 +23,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        const openaiStream = await createAnswerStream(video.transcript!, question.trim());
-        for await (const event of openaiStream) {
-          if (event.type === 'response.output_text.delta') controller.enqueue(sse({ type: 'delta', text: event.delta }));
-          else if (event.type === 'response.failed') throw new Error(event.response.error?.message || 'OpenAI Q&A failed.');
-        }
+        const answerStream = await createAnswerStream(video.transcript!, question.trim());
+        for await (const text of answerStream) controller.enqueue(sse({ type: 'delta', text }));
         controller.enqueue(sse({ type: 'done' }));
       } catch (error) {
         controller.enqueue(sse({ type: 'error', message: error instanceof Error ? error.message : 'Q&A failed' }));

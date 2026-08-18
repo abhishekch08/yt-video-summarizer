@@ -6,8 +6,6 @@ import { hasUsableTranscript, saveTranscript, upsertVideo } from '@/lib/video-st
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-const AUDIO_CHUNK_SECONDS = 8 * 60;
-
 function readableError(error: unknown) {
   const clean = (value: string) => value.split(/\r?\n/, 1)[0].trim().slice(0, 500);
   const normalize = (value: string) => {
@@ -67,17 +65,7 @@ export async function POST(req: Request) {
       });
     }
 
-    const duration = result.metadata.durationSeconds;
-    if (!duration) throw new Error('No captions were available and video duration could not be determined for audio transcription.');
-    const totalChunks = Math.ceil(duration / AUDIO_CHUNK_SECONDS);
-    return NextResponse.json({
-      status: 'needs_transcription',
-      videoId: video.id,
-      title: video.title,
-      durationSeconds: duration,
-      chunkSeconds: AUDIO_CHUNK_SECONDS,
-      totalChunks,
-    });
+    throw new Error('The free transcript sources returned no usable transcript for this video.');
   } catch (error) {
     console.error('Video prepare failed:', error);
     return NextResponse.json({ error: readableError(error) }, { status: 422 });

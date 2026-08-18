@@ -1,4 +1,4 @@
-import { ai } from '@/lib/openai';
+import { generateText, generateTextStream } from '@/lib/gemini';
 import { env } from '@/lib/env';
 import { chunkText } from '@/lib/text';
 import type { SummaryDepth, VideoType } from '@/types/app';
@@ -7,15 +7,14 @@ const TYPES: VideoType[] = ['technical', 'finance', 'tutorial', 'interview', 'ne
 
 export async function classifyVideo(title: string, transcript: string): Promise<VideoType> {
   try {
-    const response = await ai().responses.create({
+    const label = await generateText({
       model: env.classifierModel,
-      store: false,
-      max_output_tokens: 20,
       instructions: `Classify a YouTube transcript into exactly one label: ${TYPES.join(', ')}. Output only the label.`,
       input: `TITLE: ${title}\n\nTRANSCRIPT SAMPLE:\n${transcript.slice(0, 12_000)}`,
+      maxOutputTokens: 20,
     });
-    const label = response.output_text.trim().toLowerCase() as VideoType;
-    return TYPES.includes(label) ? label : 'general';
+    const normalized = label.trim().toLowerCase() as VideoType;
+    return TYPES.includes(normalized) ? normalized : 'general';
   } catch {
     return 'general';
   }
@@ -61,14 +60,12 @@ ${adaptiveRules(type)}`;
 }
 
 async function condenseChunk(chunk: string, index: number, total: number, type: VideoType) {
-  const response = await ai().responses.create({
+  return generateText({
     model: env.summaryModel,
-    store: false,
-    max_output_tokens: 3500,
     instructions: `Create dense, loss-minimizing notes from transcript chunk ${index}/${total}. Use only the chunk. Preserve facts, numbers, arguments, caveats, steps and examples that could matter in a final summary. Content type: ${type}. Do not add external knowledge.`,
     input: chunk,
+    maxOutputTokens: 3500,
   });
-  return response.output_text;
 }
 
 export async function prepareSummaryInput(transcript: string, type: VideoType, onProgress?: (message: string) => void) {
@@ -83,23 +80,19 @@ export async function prepareSummaryInput(transcript: string, type: VideoType, o
 }
 
 export async function createSummaryStream(input: string, depth: SummaryDepth, type: VideoType) {
-  return ai().responses.create({
+  return generateTextStream({
     model: env.summaryModel,
-    store: false,
-    stream: true,
-    max_output_tokens: depth === 'detailed' ? 9000 : depth === 'concise' ? 2200 : 5000,
     instructions: baseInstructions(depth, type),
     input,
+    maxOutputTokens: depth === 'detailed' ? 9000 : depth === 'concise' ? 2200 : 5000,
   });
 }
 
 export async function createAnswerStream(transcript: string, question: string) {
-  return ai().responses.create({
+  return generateTextStream({
     model: env.summaryModel,
-    store: false,
-    stream: true,
-    max_output_tokens: 3500,
     instructions: `Answer the user's question using ONLY the supplied YouTube transcript. If the answer is not in the transcript, say that clearly. Do not use outside information. Answer in English. Be precise and concise.`,
     input: `QUESTION:\n${question}\n\nTRANSCRIPT:\n${transcript}`,
+    maxOutputTokens: 3500,
   });
 }

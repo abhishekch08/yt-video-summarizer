@@ -188,26 +188,13 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
     setQueue((prev) => prev.map((item, i) => i === index ? { ...item, ...patch } : item));
   }
 
-  async function ensureTranscript(url: string, videoIdHint?: string, queueIndex?: number, forceRefresh = false) {
+  async function ensureTranscript(url: string, videoIdHint?: string, forceRefresh = false) {
     const prepared = await jsonFetch<any>('/api/videos/prepare', {
       method: 'POST', body: JSON.stringify({ url, forceRefresh }),
     });
     const id = prepared.videoId || videoIdHint;
     if (!id) throw new Error('Video ID was not returned.');
 
-    if (prepared.status === 'needs_transcription') {
-      for (let i = 0; i < prepared.totalChunks; i++) {
-        const stage = `Transcribing audio ${i + 1}/${prepared.totalChunks}`;
-        setSummaryStage(stage);
-        if (queueIndex !== undefined) updateQueue(queueIndex, { stage });
-        await jsonFetch(`/api/videos/${id}/transcribe-chunk`, {
-          method: 'POST', body: JSON.stringify({ index: i, chunkSeconds: prepared.chunkSeconds }),
-        });
-      }
-      setSummaryStage('Finalizing transcript');
-      if (queueIndex !== undefined) updateQueue(queueIndex, { stage: 'Finalizing transcript' });
-      await jsonFetch(`/api/videos/${id}/transcribe-finalize`, { method: 'POST', body: '{}' });
-    }
     return { videoId: id, title: prepared.title as string };
   }
 
@@ -251,7 +238,7 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
       for (let i = 0; i < expanded.urls.length; i++) {
         updateQueue(i, { status: 'working', stage: 'Fetching subtitles', startedAt: Date.now() });
         try {
-          const prepared = await ensureTranscript(expanded.urls[i], undefined, i, false);
+          const prepared = await ensureTranscript(expanded.urls[i]);
           updateQueue(i, { videoId: prepared.videoId, title: prepared.title, stage: 'Summarizing' });
           setSummaryStage('Summarizing');
           await openVideo(prepared.videoId);
@@ -276,7 +263,7 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
       await streamSummary(selected.id, next);
     } catch (e: any) {
       if (e.needsRefresh) {
-        await ensureTranscript(selected.url, selected.id, undefined, true);
+        await ensureTranscript(selected.url, selected.id, true);
         await streamSummary(selected.id, next);
       } else setToast(e.message || 'Could not generate summary');
     }
@@ -287,7 +274,7 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
     try { await streamSummary(selected.id, depth); }
     catch (e: any) {
       if (e.needsRefresh) {
-        await ensureTranscript(selected.url, selected.id, undefined, true);
+        await ensureTranscript(selected.url, selected.id, true);
         await streamSummary(selected.id, depth);
       } else setToast(e.message || 'Regeneration failed');
     }
@@ -303,7 +290,7 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }),
       });
       if (res.status === 409) {
-        await ensureTranscript(selected!.url, selected!.id, undefined, true);
+        await ensureTranscript(selected!.url, selected!.id, true);
         return runAsk();
       }
       if (!res.ok) {
