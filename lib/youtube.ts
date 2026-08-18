@@ -258,16 +258,35 @@ export async function fetchAudioFormat(videoUrl: string) {
   const videoId = extractYoutubeId(videoUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
   const youtube = await getYoutubeClient();
-  const format = await youtube.getStreamingData(videoId, {
-    type: 'audio',
-    quality: 'best',
-  } as any);
-  if (!format?.url) throw new Error('No downloadable audio stream was available for this video.');
-  return {
-    url: format.url,
-    mimeType: format.mime_type || 'audio/webm',
-    durationSeconds: null,
-  };
+
+  // YouTube increasingly applies different playback requirements to different InnerTube
+  // clients. A normal WEB metadata request can succeed while its streamingData is omitted.
+  // Retry a small set of official clients before treating the video as non-downloadable.
+  const clients = ['WEB', 'ANDROID_VR', 'IOS', 'TV', 'WEB_EMBEDDED'] as const;
+  const failures: string[] = [];
+
+  for (const client of clients) {
+    try {
+      const format: any = await youtube.getStreamingData(videoId, {
+        type: 'audio',
+        quality: 'best',
+        client,
+      } as any);
+      if (format?.url) {
+        return {
+          url: format.url,
+          mimeType: format.mime_type || 'audio/webm',
+          durationSeconds: null,
+        };
+      }
+      failures.push(`${client}: no URL`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push(`${client}: ${message}`);
+    }
+  }
+
+  throw new Error(`No downloadable YouTube audio stream was available. ${failures.join(' | ')}`);
 }
 
 function walkForPlaylistIds(node: unknown, out: string[]) {
