@@ -1,5 +1,5 @@
 -- Run this once in Supabase SQL Editor.
--- The web app uses the service-role key server-side only. No browser database key is used.
+-- The web app uses the service-role/secret key server-side only. No browser database key is used.
 
 create extension if not exists pgcrypto;
 create extension if not exists pg_cron;
@@ -40,6 +40,11 @@ create index if not exists videos_transcript_expiry_idx on public.videos(transcr
 alter table public.videos enable row level security;
 alter table public.transcript_chunks enable row level security;
 -- Deliberately no anon/authenticated policies. Only the server-side service role can access these rows.
+
+-- Tables created through raw SQL are not necessarily granted to Data API roles automatically.
+-- The backend uses Supabase's secret/service-role key, so grant only service_role here.
+grant select, insert, update, delete on table public.videos to service_role;
+grant select, insert, update, delete on table public.transcript_chunks to service_role;
 
 create or replace function public.cleanup_expired_video_transcripts()
 returns void
