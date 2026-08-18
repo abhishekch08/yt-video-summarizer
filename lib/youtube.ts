@@ -1,6 +1,7 @@
-import { Innertube, UniversalCache } from 'youtubei.js';
+import { Innertube, Platform, Types, UniversalCache } from 'youtubei.js';
 import { env } from '@/lib/env';
 import { cleanTranscript, decodeHtml } from '@/lib/text';
+import { mintYoutubeContentPoToken } from '@/lib/youtube-potoken';
 
 export interface YoutubeMetadata {
   videoId: string;
@@ -17,6 +18,10 @@ export interface CaptionResult {
 }
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
+
+// Current YouTube.js uses its platform shim when deciphering protected media URLs.
+// The official BgUtils + YouTube.js Node example provides an eval implementation.
+Platform.shim.eval = async (data: Types.BuildScriptResult) => new Function(data.output)();
 
 function requestHeaders() {
   const headers: Record<string, string> = {
@@ -133,27 +138,27 @@ async function getYoutubeClient() {
   return youtubeClient;
 }
 
-async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
-  const youtube = await getYoutubeClient();
-  const info: any = await youtube.getInfo(videoId);
-
-  const playability = info.playability_status;
-  if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
-    const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
-    throw new Error(`YouTube internal API access error: ${reason}`);
-  }
-
-  const basic = info.basic_info || {};
-  const metadata: YoutubeMetadata = {
+function metadataFromInfo(videoId: string, info: any): YoutubeMetadata {
+  const basic = info?.basic_info || {};
+  const duration = Number(basic.duration);
+  return {
     videoId,
     url: `https://www.youtube.com/watch?v=${videoId}`,
     title: basic.title || `YouTube video ${videoId}`,
     channel: basic.channel?.name || basic.author || null,
-    durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
+    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
   };
+}
 
-  // The player response often exposes caption tracks even when the separate transcript
-  // engagement-panel endpoint is unavailable. Prefer these direct timed-text URLs first.
+function assertPlayable(info: any, prefix: string) {
+  const playability = info?.playability_status;
+  if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
+    const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
+    throw new Error(`${prefix}: ${reason}`);
+  }
+}
+
+async function transcriptFromInfo(info: any, metadata: YoutubeMetadata): Promise<CaptionResult | null> {
   const directTracks: any[] = info.captions?.caption_tracks || [];
   if (directTracks.length) {
     const track = selectCaptionTrack(directTracks);
@@ -169,7 +174,7 @@ async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
           };
         }
       } catch {
-        // Fall through to the transcript engagement-panel API below.
+        // Continue to the engagement-panel transcript API.
       }
     }
   }
@@ -194,16 +199,49 @@ async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
       };
     }
   } catch {
-    // Continue to the normal no-caption/audio-transcription path below.
+    // A video may genuinely have no searchable transcript panel.
   }
 
-  // An empty player response usually means YouTube challenged the cloud request. Do not
-  // report that as a genuine no-caption video; throw so the watch-page fallback is tried.
-  if (!basic.title && metadata.durationSeconds === null) {
+  return null;
+}
+
+async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
+  const youtube = await getYoutubeClient();
+  const info: any = await youtube.getInfo(videoId);
+  assertPlayable(info, 'YouTube internal API access error');
+
+  const metadata = metadataFromInfo(videoId, info);
+  const captionResult = await transcriptFromInfo(info, metadata);
+  if (captionResult) return captionResult;
+
+  if (metadata.title === `YouTube video ${videoId}` && metadata.durationSeconds === null) {
     throw new Error('YouTube internal API returned no usable video metadata');
   }
-
   return { metadata, transcript: null };
+}
+
+async function fetchViaPoToken(videoId: string): Promise<CaptionResult> {
+  const youtube = await getYoutubeClient();
+  const poToken = await mintYoutubeContentPoToken(videoId);
+  const clients = ['YTMUSIC', 'WEB', 'WEB_EMBEDDED'] as const;
+  const failures: string[] = [];
+  let bestMetadata: YoutubeMetadata | null = null;
+
+  for (const client of clients) {
+    try {
+      const info: any = await youtube.getInfo(videoId, { client, po_token: poToken } as any);
+      assertPlayable(info, `${client} protected player`);
+      const metadata = metadataFromInfo(videoId, info);
+      if (!bestMetadata || metadata.durationSeconds) bestMetadata = metadata;
+      const captionResult = await transcriptFromInfo(info, metadata);
+      if (captionResult) return captionResult;
+    } catch (error) {
+      failures.push(`${client}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (bestMetadata) return { metadata: bestMetadata, transcript: null };
+  throw new Error(`Protected YouTube player returned no usable metadata. ${failures.join(' | ')}`);
 }
 
 async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
@@ -217,7 +255,7 @@ async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
     url: `https://www.youtube.com/watch?v=${videoId}`,
     title: vd.title || `YouTube video ${videoId}`,
     channel: vd.author || null,
-    durationSeconds: Number.isFinite(Number(vd.lengthSeconds)) ? Number(vd.lengthSeconds) : null,
+    durationSeconds: Number.isFinite(Number(vd.lengthSeconds)) && Number(vd.lengthSeconds) > 0 ? Number(vd.lengthSeconds) : null,
   };
 
   const playability = player.playabilityStatus;
@@ -239,33 +277,82 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
   const videoId = extractYoutubeId(inputUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
 
-  // Prefer YouTube's internal API through YouTube.js. This avoids making the public
-  // watch-page HTML request the single point of failure on cloud-hosted IP ranges.
+  const failures: string[] = [];
+  let normalResult: CaptionResult | null = null;
+
   try {
-    return await fetchViaInnertube(videoId);
-  } catch (innerError) {
-    try {
-      return await fetchViaWatchPage(videoId);
-    } catch (pageError) {
-      const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
-      const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
-      throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
-    }
+    normalResult = await fetchViaInnertube(videoId);
+    if (normalResult.transcript) return normalResult;
+  } catch (error) {
+    failures.push(`Internal API: ${error instanceof Error ? error.message : String(error)}`);
   }
+
+  // If normal caption discovery did not succeed, retry through a current content-bound
+  // WebPO token before declaring the video captionless or moving to audio transcription.
+  try {
+    const protectedResult = await fetchViaPoToken(videoId);
+    if (protectedResult.transcript) return protectedResult;
+    if (protectedResult.metadata.durationSeconds) return protectedResult;
+  } catch (error) {
+    failures.push(`PoToken player: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (normalResult?.metadata.durationSeconds) return normalResult;
+
+  try {
+    return await fetchViaWatchPage(videoId);
+  } catch (error) {
+    failures.push(`Watch page: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  throw new Error(`YouTube access failed. ${failures.join(' | ')}`);
 }
 
 export async function fetchAudioFormat(videoUrl: string) {
   const videoId = extractYoutubeId(videoUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
   const youtube = await getYoutubeClient();
-
-  // YouTube increasingly applies different playback requirements to different InnerTube
-  // clients. A normal WEB metadata request can succeed while its streamingData is omitted.
-  // Retry a small set of official clients before treating the video as non-downloadable.
-  const clients = ['WEB', 'ANDROID_VR', 'IOS', 'TV', 'WEB_EMBEDDED'] as const;
   const failures: string[] = [];
 
-  for (const client of clients) {
+  // Primary path: YouTube's current WebPO flow. BgUtils' current reference example
+  // mints a token bound to the video ID, requests player data, deciphers the chosen
+  // audio format, then appends the same token to the media URL.
+  try {
+    const poToken = await mintYoutubeContentPoToken(videoId);
+    const protectedClients = ['YTMUSIC', 'WEB', 'WEB_EMBEDDED'] as const;
+
+    for (const client of protectedClients) {
+      try {
+        const info: any = await youtube.getBasicInfo(videoId, { client, po_token: poToken } as any);
+        assertPlayable(info, `${client} protected player`);
+        if (!info.streaming_data) throw new Error('Streaming data not available');
+
+        const format: any = info.chooseFormat({
+          quality: 'best',
+          type: 'audio',
+        });
+        let url = await format.decipher(youtube.session.player);
+        if (!url) throw new Error('Audio URL decipher returned empty result');
+        const separator = url.includes('?') ? '&' : '?';
+        if (!/[?&]pot=/.test(url)) url = `${url}${separator}pot=${encodeURIComponent(poToken)}`;
+
+        return {
+          url,
+          mimeType: format.mime_type || 'audio/webm',
+          durationSeconds: null,
+        };
+      } catch (error) {
+        failures.push(`${client}+PoToken: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  } catch (error) {
+    failures.push(`PoToken: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Secondary compatibility path. Some videos/regions still expose media data without
+  // WebPO on another official InnerTube client, so retain these cheap fallbacks.
+  const legacyClients = ['WEB', 'ANDROID_VR', 'IOS', 'TV', 'WEB_EMBEDDED'] as const;
+  for (const client of legacyClients) {
     try {
       const format: any = await youtube.getStreamingData(videoId, {
         type: 'audio',
@@ -281,8 +368,7 @@ export async function fetchAudioFormat(videoUrl: string) {
       }
       failures.push(`${client}: no URL`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      failures.push(`${client}: ${message}`);
+      failures.push(`${client}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -342,8 +428,6 @@ export async function expandPlaylist(inputUrl: string) {
   try {
     ids = await expandPlaylistWithInnertube(listId);
   } catch {
-    // Keep an independent page-parser fallback so a library/parser regression does not
-    // make all playlist URLs unusable at once.
     ids = await expandPlaylistFromPage(listId);
   }
 
