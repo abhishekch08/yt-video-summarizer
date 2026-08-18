@@ -119,9 +119,56 @@ async function fetchCaptionText(baseUrl: string) {
   return cleanTranscript(pieces);
 }
 
-export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<CaptionResult> {
-  const videoId = extractYoutubeId(inputUrl);
-  if (!videoId) throw new Error('Invalid YouTube video URL');
+let youtubeClient: Promise<Innertube> | null = null;
+
+async function getYoutubeClient() {
+  if (!youtubeClient) {
+    youtubeClient = Innertube.create({
+      cookie: env.youtubeCookie,
+      cache: new UniversalCache(false),
+      generate_session_locally: true,
+    });
+  }
+  return youtubeClient;
+}
+
+async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
+  const youtube = await getYoutubeClient();
+  const info: any = await youtube.getInfo(videoId);
+  const basic = info.basic_info || {};
+  const metadata: YoutubeMetadata = {
+    videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    title: basic.title || `YouTube video ${videoId}`,
+    channel: basic.channel?.name || basic.author || null,
+    durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
+  };
+
+  try {
+    let transcriptInfo: any = await info.getTranscript();
+    const english = (transcriptInfo.languages || []).find((name: string) => /^english\b/i.test(name));
+    if (english && !/^english\b/i.test(transcriptInfo.selectedLanguage || '')) {
+      try { transcriptInfo = await transcriptInfo.selectLanguage(english); } catch {}
+    }
+
+    const segments: any[] = transcriptInfo.transcript?.content?.body?.initial_segments || [];
+    const pieces = segments
+      .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
+      .filter((text: string) => text.trim());
+    const transcript = cleanTranscript(pieces);
+    return {
+      metadata,
+      transcript: transcript || null,
+      captionLanguage: transcriptInfo.selectedLanguage || undefined,
+    };
+  } catch {
+    // Metadata retrieval succeeded but the transcript endpoint did not. Treat this as
+    // a no-caption result so the existing audio-transcription fallback can take over.
+    return { metadata, transcript: null };
+  }
+}
+
+async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
   const html = await fetchWatchPage(videoId);
   const player = extractAssignedJson(html, 'ytInitialPlayerResponse');
   if (!player) throw new Error('Could not read YouTube player metadata. The video may require authentication or YouTube may have blocked the request.');
@@ -150,16 +197,23 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
   return { metadata, transcript: transcript || null, captionLanguage: track.languageCode };
 }
 
-let youtubeClient: Promise<Innertube> | null = null;
+export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<CaptionResult> {
+  const videoId = extractYoutubeId(inputUrl);
+  if (!videoId) throw new Error('Invalid YouTube video URL');
 
-async function getYoutubeClient() {
-  if (!youtubeClient) {
-    youtubeClient = Innertube.create({
-      cookie: env.youtubeCookie,
-      cache: new UniversalCache(false),
-    });
+  // Prefer YouTube's internal API through YouTube.js. This avoids making the public
+  // watch-page HTML request the single point of failure on cloud-hosted IP ranges.
+  try {
+    return await fetchViaInnertube(videoId);
+  } catch (innerError) {
+    try {
+      return await fetchViaWatchPage(videoId);
+    } catch (pageError) {
+      const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
+      const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
+      throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
+    }
   }
-  return youtubeClient;
 }
 
 export async function fetchAudioFormat(videoUrl: string) {
