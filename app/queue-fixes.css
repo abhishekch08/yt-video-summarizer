@@ -1,0 +1,14 @@
+.queue-copy { flex: 1 1 auto; }
+.queue-row { align-items: flex-start; }
+.queue-status { margin-top: 1px; }
+.queue-copy small {
+  max-width: 100%;
+}
+.queue-status.error + .queue-copy small,
+.queue-row:has(.queue-status.error) .queue-copy small {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
