@@ -8,6 +8,19 @@ export const maxDuration = 300;
 
 const AUDIO_CHUNK_SECONDS = 8 * 60;
 
+function readableError(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object') {
+    const value = error as Record<string, unknown>;
+    const parts = [value.message, value.details, value.hint, value.code]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
+    if (parts.length) return parts.join(' | ');
+    try { return JSON.stringify(error); } catch {}
+  }
+  if (typeof error === 'string' && error.trim()) return error;
+  return 'Could not prepare video';
+}
+
 export async function POST(req: Request) {
   const auth = await requireAuth();
   if (auth) return auth;
@@ -57,7 +70,7 @@ export async function POST(req: Request) {
       totalChunks,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Could not prepare video';
-    return NextResponse.json({ error: message }, { status: 422 });
+    console.error('Video prepare failed:', error);
+    return NextResponse.json({ error: readableError(error) }, { status: 422 });
   }
 }
