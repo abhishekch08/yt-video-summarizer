@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
+import './queue-fixes.css';
 
 export const metadata: Metadata = {
   title: 'Video Summary',
