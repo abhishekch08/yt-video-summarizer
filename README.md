@@ -8,7 +8,7 @@ A private, mobile-first YouTube summarizer designed for free hosting/storage tie
 - Processes videos **one at a time**.
 - Retrieves creator or auto-generated captions first.
 - Aggressively cleans caption noise without intentionally changing meaning.
-- If Vercel receives an empty YouTube caption body, retries the signed public caption URL through Jina Reader's free, keyless relay.
+- If Vercel cannot discover or fetch captions, retries through free, keyless Invidious Companion and Jina Reader fallbacks.
 - If a video has no captions, attempts chunked audio transcription with OpenAI.
 - Streams an English summary live in a ChatGPT-like dark UI.
 - Summary structure adapts to technical, finance, tutorial, interview, news, educational, or general content.
@@ -29,6 +29,7 @@ A private, mobile-first YouTube summarizer designed for free hosting/storage tie
 - OpenAI Responses API (`gpt-5-mini` by default)
 - `gpt-5-nano` for content classification
 - `gpt-4o-mini-transcribe` for no-caption audio fallback
+- Invidious Companion's free, keyless caption discovery
 - Jina Reader's free, keyless caption relay
 - `youtubei.js` + bundled `ffmpeg-static` for extraction
 
@@ -83,14 +84,16 @@ Important: no application can access a private/member video if the YouTube accou
 
 ### Free caption fallback
 
-YouTube sometimes advertises captions while withholding their body from Vercel cloud IP
-addresses. The app first tries YouTube directly. If the signed caption URL returns an empty
-body, it retries that public caption URL through `r.jina.ai`. This fallback is free and does
-not require an account or API key. Authenticated/private caption URLs are never relayed.
+YouTube sometimes blocks caption discovery or withholds caption bodies from Vercel cloud IP
+addresses. The app first tries YouTube directly. If discovery is blocked, it checks a small,
+fixed allowlist of public Invidious Companion caption endpoints. If YouTube returns a signed
+caption URL but withholds its body, the app retries it through `r.jina.ai`. Both fallbacks are
+free and require no account or API key. Authenticated/private caption URLs are never sent to them.
 
-Jina Reader is an external service and may rate-limit or change availability. The app uses
-it only after direct caption retrieval fails and never sends the OpenAI key, Supabase keys,
-PIN, session secret, or YouTube cookie to it.
+These public services may rate-limit or change availability. The app uses them only after
+direct caption retrieval fails, sends only the public video ID or signed public caption URL,
+validates caption hosts, and never sends OpenAI keys, Supabase keys, PIN, session secret, or
+YouTube cookie.
 
 ## 4. Deploy on Vercel
 
@@ -114,10 +117,11 @@ Supabase Free currently provides a 500 MB database. For personal use this should
 
 ## Cost boundaries
 
-Vercel Hobby, Supabase Free, direct YouTube extraction, and the Jina caption relay do not
-require a paid plan. OpenAI is the only paid API. Captioned videos use OpenAI only for
-classification, summarization, and Q&A. Videos without captions may additionally consume
-OpenAI transcription usage if YouTube exposes an audio stream to the deployment.
+Vercel Hobby, Supabase Free, direct YouTube extraction, Invidious Companion, and the Jina
+caption relay do not require a paid plan. OpenAI is the only paid API. Captioned videos use
+OpenAI only for classification, summarization, and Q&A. Videos without captions may
+additionally consume OpenAI transcription usage if YouTube exposes an audio stream to the
+deployment.
 
 ## Models
 

@@ -18,6 +18,13 @@ export interface CaptionResult {
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
 
+// A public Invidious Companion can discover captions when YouTube blocks the
+// deployment. Keep this list small and explicit: only a public video ID is sent,
+// and returned caption URLs must stay on the exact allowlisted host and path.
+const FREE_CAPTION_DISCOVERY_ENDPOINTS = [
+  'https://jp1-cmp.invidious.f5.si/companion/api/v1/captions',
+] as const;
+
 class CaptionAccessError extends Error {
   constructor(
     message: string,
@@ -123,6 +130,111 @@ function transcriptFromJson3(body: string) {
     if (text.trim()) pieces.push(text);
   }
   return cleanTranscript(pieces);
+}
+
+function transcriptFromWebVtt(body: string) {
+  const pieces = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line
+      && !/^WEBVTT\b/i.test(line)
+      && !/^(Kind|Language):/i.test(line)
+      && !/^(NOTE|STYLE|REGION)\b/i.test(line)
+      && !/^\d+$/.test(line)
+      && !/^\d{1,2}:\d{2}(?::\d{2})?\.\d{3}\s+-->/.test(line));
+  return cleanTranscript(pieces);
+}
+
+interface FreeCaptionDiscoveryResult {
+  transcript: string;
+  captionLanguage?: string;
+}
+
+async function fetchViaFreeCaptionDiscovery(videoId: string): Promise<FreeCaptionDiscoveryResult> {
+  const failures: string[] = [];
+
+  for (const baseUrl of FREE_CAPTION_DISCOVERY_ENDPOINTS) {
+    const endpointUrl = new URL(`${baseUrl}/${encodeURIComponent(videoId)}`);
+    try {
+      const listResponse = await fetch(endpointUrl, {
+        headers: {
+          'user-agent': UA,
+          accept: 'application/json',
+        },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(20_000),
+      });
+      const listBody = await listResponse.text();
+      if (!listResponse.ok || !listBody.trim()) {
+        failures.push(`${endpointUrl.hostname} list HTTP ${listResponse.status}`);
+        continue;
+      }
+
+      const data = JSON.parse(listBody) as {
+        captions?: Array<{ label?: string; languageCode?: string; url?: string }>;
+      };
+      const tracks = (Array.isArray(data.captions) ? data.captions : [])
+        .map((track) => {
+          if (!track.url) return null;
+          const label = String(track.label || '');
+          const language = String(track.languageCode || '');
+          let score = 0;
+          if (/^en(?:-|$)/i.test(language || '')) score += 100;
+          if (/english/i.test(label)) score += 80;
+          if (!/auto-generated/i.test(label)) score += 20;
+          return { url: track.url, label, language, score };
+        })
+        .filter((track): track is NonNullable<typeof track> => Boolean(track))
+        .sort((a, b) => b.score - a.score);
+
+      if (!tracks.length) {
+        failures.push(`${endpointUrl.hostname} exposed no caption tracks`);
+        continue;
+      }
+
+      for (const track of tracks) {
+        try {
+          const captionUrl = new URL(track.url, endpointUrl);
+          const expectedPath = `${new URL(baseUrl).pathname}/${videoId}`;
+          if (captionUrl.protocol !== 'https:'
+            || captionUrl.hostname !== endpointUrl.hostname
+            || captionUrl.pathname !== expectedPath) {
+            failures.push(`${endpointUrl.hostname} returned a caption URL outside its allowed boundary`);
+            continue;
+          }
+
+          const captionResponse = await fetch(captionUrl, {
+            headers: {
+              'user-agent': UA,
+              accept: 'text/vtt,text/plain;q=0.9',
+            },
+            cache: 'no-store',
+            signal: AbortSignal.timeout(20_000),
+          });
+          const body = await captionResponse.text();
+          if (!captionResponse.ok || !body.trim()) {
+            failures.push(`${endpointUrl.hostname} caption HTTP ${captionResponse.status}`);
+            continue;
+          }
+
+          const transcript = transcriptFromWebVtt(body);
+          if (transcript) {
+            return {
+              transcript,
+              captionLanguage: track.language || track.label || undefined,
+            };
+          }
+          failures.push(`${endpointUrl.hostname} returned an empty caption transcript`);
+        } catch (error) {
+          failures.push(`${endpointUrl.hostname} caption request: ${safeErrorMessage(error)}`);
+        }
+      }
+    } catch (error) {
+      failures.push(`${endpointUrl.hostname} list request: ${safeErrorMessage(error)}`);
+    }
+  }
+
+  throw new Error(failures.join(' | ') || 'No free caption discovery instance was available.');
 }
 
 function jinaCaptionUrl(captionUrl: URL) {
@@ -394,6 +506,21 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
     || (innerError instanceof CaptionAccessError ? innerError.metadata : undefined)
     || (pageError instanceof CaptionAccessError ? pageError.metadata : undefined)
     || await fetchOEmbedMetadata(inputUrl, videoId);
+
+  // This fallback is intentionally restricted to public requests. Cookie-backed
+  // or private video data must never be sent to a third-party discovery service.
+  if (!env.youtubeCookie) {
+    try {
+      const discovered = await fetchViaFreeCaptionDiscovery(videoId);
+      return {
+        metadata,
+        transcript: discovered.transcript,
+        captionLanguage: discovered.captionLanguage,
+      };
+    } catch (error) {
+      console.error(`[youtube-free-caption-discovery] video=${videoId}`, safeErrorMessage(error));
+    }
+  }
 
   if (innerResult || pageResult) return innerResult || pageResult!;
 
