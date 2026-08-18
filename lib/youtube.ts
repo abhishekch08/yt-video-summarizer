@@ -82,8 +82,9 @@ async function fetchWatchPage(videoId: string) {
 
 function selectCaptionTrack(tracks: any[]) {
   const scored = tracks.map((t) => {
-    const lang = String(t.languageCode || '').toLowerCase();
-    const name = String(t.name?.simpleText || '');
+    const lang = String(t.languageCode || t.language_code || '').toLowerCase();
+    const rawName = t.name?.simpleText ?? t.name?.toString?.() ?? t.name ?? '';
+    const name = String(rawName);
     const manual = t.kind !== 'asr';
     let score = 0;
     if (lang === 'en' || lang.startsWith('en-')) score += 100;
@@ -135,6 +136,13 @@ async function getYoutubeClient() {
 async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
   const youtube = await getYoutubeClient();
   const info: any = await youtube.getInfo(videoId);
+
+  const playability = info.playability_status;
+  if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
+    const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
+    throw new Error(`YouTube internal API access error: ${reason}`);
+  }
+
   const basic = info.basic_info || {};
   const metadata: YoutubeMetadata = {
     videoId,
@@ -143,6 +151,28 @@ async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
     channel: basic.channel?.name || basic.author || null,
     durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
   };
+
+  // The player response often exposes caption tracks even when the separate transcript
+  // engagement-panel endpoint is unavailable. Prefer these direct timed-text URLs first.
+  const directTracks: any[] = info.captions?.caption_tracks || [];
+  if (directTracks.length) {
+    const track = selectCaptionTrack(directTracks);
+    const baseUrl = track?.base_url || track?.baseUrl;
+    if (baseUrl) {
+      try {
+        const transcript = await fetchCaptionText(baseUrl);
+        if (transcript) {
+          return {
+            metadata,
+            transcript,
+            captionLanguage: track.language_code || track.languageCode || undefined,
+          };
+        }
+      } catch {
+        // Fall through to the transcript engagement-panel API below.
+      }
+    }
+  }
 
   try {
     let transcriptInfo: any = await info.getTranscript();
@@ -156,16 +186,24 @@ async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
       .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
       .filter((text: string) => text.trim());
     const transcript = cleanTranscript(pieces);
-    return {
-      metadata,
-      transcript: transcript || null,
-      captionLanguage: transcriptInfo.selectedLanguage || undefined,
-    };
+    if (transcript) {
+      return {
+        metadata,
+        transcript,
+        captionLanguage: transcriptInfo.selectedLanguage || undefined,
+      };
+    }
   } catch {
-    // Metadata retrieval succeeded but the transcript endpoint did not. Treat this as
-    // a no-caption result so the existing audio-transcription fallback can take over.
-    return { metadata, transcript: null };
+    // Continue to the normal no-caption/audio-transcription path below.
   }
+
+  // An empty player response usually means YouTube challenged the cloud request. Do not
+  // report that as a genuine no-caption video; throw so the watch-page fallback is tried.
+  if (!basic.title && metadata.durationSeconds === null) {
+    throw new Error('YouTube internal API returned no usable video metadata');
+  }
+
+  return { metadata, transcript: null };
 }
 
 async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
