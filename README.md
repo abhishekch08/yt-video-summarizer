@@ -1,6 +1,6 @@
 # Video Summary
 
-A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase Free, with OpenAI as the only paid API.
+A private, mobile-first YouTube summarizer designed for free hosting/storage tiers, with OpenAI as the only paid API.
 
 ## What it does
 
@@ -8,7 +8,8 @@ A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase 
 - Processes videos **one at a time**.
 - Retrieves creator or auto-generated captions first.
 - Aggressively cleans caption noise without intentionally changing meaning.
-- If captions are unavailable, downloads audio in small time windows and transcribes each window with OpenAI.
+- If Vercel receives an empty YouTube caption body, retries the signed public caption URL through Jina Reader's free, keyless relay.
+- If a video has no captions, attempts chunked audio transcription with OpenAI.
 - Streams an English summary live in a ChatGPT-like dark UI.
 - Summary structure adapts to technical, finance, tutorial, interview, news, educational, or general content.
 - Summary depth: **Concise / Standard / Detailed**; Standard is default.
@@ -26,10 +27,10 @@ A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase 
 - Vercel Hobby
 - Supabase Free Postgres
 - OpenAI Responses API (`gpt-5-mini` by default)
-- `gpt-5-nano` for cheap content classification
-- `gpt-4o-mini-transcribe` for audio fallback
-- `youtubei.js` + bundled `ffmpeg-static` for chunked audio extraction
-- optional authenticated proxy egress for cloud IPs that YouTube restricts
+- `gpt-5-nano` for content classification
+- `gpt-4o-mini-transcribe` for no-caption audio fallback
+- Jina Reader's free, keyless caption relay
+- `youtubei.js` + bundled `ffmpeg-static` for extraction
 
 ## 1. Create Supabase project
 
@@ -80,30 +81,22 @@ Use the Cookie header from a YouTube/Google account that is already authorized t
 
 Important: no application can access a private/member video if the YouTube account represented by the cookie is not authorized to view it. YouTube can also block cloud-hosted extraction traffic or change undocumented interfaces; the app reports these failures rather than hiding them.
 
-### Vercel / cloud egress
+### Free caption fallback
 
-YouTube can advertise a caption track or return video metadata while withholding the
-caption body and media streams from a cloud-hosted IP. If that happens, configure a
-trusted HTTP(S) proxy whose egress can reach YouTube:
+YouTube sometimes advertises captions while withholding their body from Vercel cloud IP
+addresses. The app first tries YouTube directly. If the signed caption URL returns an empty
+body, it retries that public caption URL through `r.jina.ai`. This fallback is free and does
+not require an account or API key. Authenticated/private caption URLs are never relayed.
 
-```text
-YOUTUBE_PROXY_URL=http://username:password@proxy-host:port
-```
-
-The same proxy is used for player metadata, captions, playlists, and FFmpeg audio
-requests. Store it only in Vercel environment variables. The app redacts the proxy and
-signed media URLs from user-facing conversion errors.
-
-For reliable production use, use a private authenticated proxy. Public/free proxies are
-not appropriate because transcripts, cookies, and signed media requests would pass
-through that operator.
+Jina Reader is an external service and may rate-limit or change availability. The app uses
+it only after direct caption retrieval fails and never sends the OpenAI key, Supabase keys,
+PIN, session secret, or YouTube cookie to it.
 
 ## 4. Deploy on Vercel
 
 1. Push this folder to a GitHub repository.
 2. In Vercel choose **Add New → Project** and import that repository.
 3. Add all required variables from `.env.example` under **Project Settings → Environment Variables**.
-   Add `YOUTUBE_PROXY_URL` as well if Vercel's direct egress is restricted by YouTube.
 4. Enable **Fluid Compute** for the project if it is not already enabled.
 5. Deploy.
 
@@ -119,13 +112,12 @@ The heavy API routes specify a 300-second maximum duration, matching the current
 
 Supabase Free currently provides a 500 MB database. For personal use this should be adequate for a substantial summary library, but raw transcripts are deliberately expired because they are the largest persistent objects.
 
-## Long videos
+## Cost boundaries
 
-Captioned videos are cheap and efficient because only text is processed.
-
-No-caption videos are split into 8-minute audio windows. Each window is handled by a separate Vercel request and transcribed independently, which prevents one very long video from requiring a single multi-hour server process. The UI processes those windows sequentially and shows progress.
-
-A chunk can still fail because of YouTube throttling, authentication, network conditions, Vercel execution limits, or OpenAI/API errors. The app returns a specific error in the queue instead of freezing.
+Vercel Hobby, Supabase Free, direct YouTube extraction, and the Jina caption relay do not
+require a paid plan. OpenAI is the only paid API. Captioned videos use OpenAI only for
+classification, summarization, and Q&A. Videos without captions may additionally consume
+OpenAI transcription usage if YouTube exposes an audio stream to the deployment.
 
 ## Models
 

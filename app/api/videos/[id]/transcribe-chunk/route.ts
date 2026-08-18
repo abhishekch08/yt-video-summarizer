@@ -21,15 +21,12 @@ function runFfmpeg(args: string[]) {
     if (!ffmpegPath) return reject(new Error('ffmpeg binary is unavailable in this deployment.'));
     const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
       else {
-        const safeDetail = stderr
-          .slice(-1200)
-          .replace(/https?:\/\/\S+/gi, '[redacted URL]')
-          .replace(env.youtubeProxyUrl || /$^/, '[redacted proxy]');
+        const safeDetail = stderr.slice(-1200).replace(/https?:\/\/\S+/gi, '[redacted URL]');
         reject(new Error(`Audio conversion failed${safeDetail ? `: ${safeDetail}` : ''}`));
       }
     });
@@ -74,13 +71,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     const audio = await fetchAudioFormat(video.url);
     outputPath = path.join(os.tmpdir(), `yt-${id}-${index}-${Date.now()}.mp3`);
-    const proxyArgs = env.youtubeProxyUrl ? ['-http_proxy', env.youtubeProxyUrl] : [];
     await runFfmpeg([
       '-hide_banner', '-loglevel', 'error',
       '-ss', String(start),
       '-user_agent', MEDIA_UA,
       '-headers', mediaHeaders(),
-      ...proxyArgs,
       '-i', audio.url,
       '-t', String(duration),
       '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',
@@ -107,8 +102,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     return NextResponse.json({ ok: true, index, seconds: duration });
   } catch (error) {
-    // Keep the browser response concise enough for the queue UI, but preserve the
-    // complete diagnostic in Vercel Runtime Logs (including all attempted clients).
     console.error(`[transcribe-chunk] video=${id}`, error);
     const message = error instanceof Error ? error.message : 'Audio transcription failed';
     const hostingHint = /timeout|timed out|FUNCTION_INVOCATION_TIMEOUT/i.test(message)
