@@ -79,6 +79,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     return NextResponse.json({ ok: true, index, seconds: duration });
   } catch (error) {
+    // Keep the browser response concise enough for the queue UI, but preserve the
+    // complete diagnostic in Vercel Runtime Logs (including all attempted clients).
+    console.error(`[transcribe-chunk] video=${id}`, error);
     const message = error instanceof Error ? error.message : 'Audio transcription failed';
     const hostingHint = /timeout|timed out|FUNCTION_INVOCATION_TIMEOUT/i.test(message)
       ? ' Vercel Hobby execution limits were reached for this chunk.' : '';
