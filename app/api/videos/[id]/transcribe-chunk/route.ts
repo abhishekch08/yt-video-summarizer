@@ -14,6 +14,8 @@ import { db } from '@/lib/supabase';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
+const MEDIA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
+
 function runFfmpeg(args: string[]) {
   return new Promise<void>((resolve, reject) => {
     if (!ffmpegPath) return reject(new Error('ffmpeg binary is unavailable in this deployment.'));
@@ -32,6 +34,23 @@ function runFfmpeg(args: string[]) {
       }
     });
   });
+}
+
+function mediaHeaders() {
+  const lines = [
+    'Referer: https://www.youtube.com/',
+    'Origin: https://www.youtube.com',
+  ];
+  if (env.youtubeCookie) lines.push(`Cookie: ${env.youtubeCookie}`);
+  return `${lines.join('\r\n')}\r\n`;
+}
+
+function browserSafeError(message: string) {
+  if (/HTTP error 403|Server returned 403|403 Forbidden/i.test(message)) {
+    return 'YouTube rejected the protected audio download (HTTP 403). Full diagnostics were written to Vercel Runtime Logs.';
+  }
+  if (message.length > 420) return `${message.slice(0, 417)}...`;
+  return message;
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -59,7 +78,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     await runFfmpeg([
       '-hide_banner', '-loglevel', 'error',
       '-ss', String(start),
-      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+      '-user_agent', MEDIA_UA,
+      '-headers', mediaHeaders(),
       ...proxyArgs,
       '-i', audio.url,
       '-t', String(duration),
@@ -93,7 +113,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const message = error instanceof Error ? error.message : 'Audio transcription failed';
     const hostingHint = /timeout|timed out|FUNCTION_INVOCATION_TIMEOUT/i.test(message)
       ? ' Vercel Hobby execution limits were reached for this chunk.' : '';
-    return NextResponse.json({ error: `${message}${hostingHint}` }, { status: 422 });
+    return NextResponse.json({ error: `${browserSafeError(message)}${hostingHint}` }, { status: 422 });
   } finally {
     if (outputPath) fs.promises.unlink(outputPath).catch(() => {});
   }
