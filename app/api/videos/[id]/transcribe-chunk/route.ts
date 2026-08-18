@@ -14,6 +14,8 @@ import { db } from '@/lib/supabase';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
+const MEDIA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
+
 function runFfmpeg(args: string[]) {
   return new Promise<void>((resolve, reject) => {
     if (!ffmpegPath) return reject(new Error('ffmpeg binary is unavailable in this deployment.'));
@@ -23,9 +25,29 @@ function runFfmpeg(args: string[]) {
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`Audio conversion failed${stderr ? `: ${stderr.slice(-1200)}` : ''}`));
+      else reject(new Error(`Audio conversion failed${stderr ? `: ${stderr.slice(-1800)}` : ''}`));
     });
   });
+}
+
+function mediaHeaders() {
+  const lines = [
+    'Referer: https://www.youtube.com/',
+    'Origin: https://www.youtube.com',
+  ];
+  if (env.youtubeCookie) lines.push(`Cookie: ${env.youtubeCookie}`);
+  return `${lines.join('\r\n')}\r\n`;
+}
+
+function browserSafeError(message: string) {
+  if (/No downloadable YouTube audio stream|PoToken generation failed|protected player/i.test(message)) {
+    return 'YouTube did not provide a usable protected audio stream to the server. Full diagnostics were written to Vercel Runtime Logs.';
+  }
+  if (/HTTP error 403|Server returned 403|403 Forbidden/i.test(message)) {
+    return 'YouTube rejected the protected audio download (HTTP 403). Full diagnostics were written to Vercel Runtime Logs.';
+  }
+  if (message.length > 420) return `${message.slice(0, 417)}...`;
+  return message;
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -52,7 +74,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     await runFfmpeg([
       '-hide_banner', '-loglevel', 'error',
       '-ss', String(start),
-      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+      '-user_agent', MEDIA_UA,
+      '-headers', mediaHeaders(),
       '-i', audio.url,
       '-t', String(duration),
       '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',
@@ -79,13 +102,11 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     return NextResponse.json({ ok: true, index, seconds: duration });
   } catch (error) {
-    // Keep the browser response concise enough for the queue UI, but preserve the
-    // complete diagnostic in Vercel Runtime Logs (including all attempted clients).
-    console.error(`[transcribe-chunk] video=${id}`, error);
     const message = error instanceof Error ? error.message : 'Audio transcription failed';
+    console.error(`[transcribe-chunk] video=${id} full-error=${message}`, error);
     const hostingHint = /timeout|timed out|FUNCTION_INVOCATION_TIMEOUT/i.test(message)
       ? ' Vercel Hobby execution limits were reached for this chunk.' : '';
-    return NextResponse.json({ error: `${message}${hostingHint}` }, { status: 422 });
+    return NextResponse.json({ error: `${browserSafeError(message)}${hostingHint}` }, { status: 422 });
   } finally {
     if (outputPath) fs.promises.unlink(outputPath).catch(() => {});
   }
