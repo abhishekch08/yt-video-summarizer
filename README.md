@@ -1,6 +1,6 @@
 # Video Summary
 
-A private, mobile-first YouTube summarizer designed to run entirely on free service tiers.
+A private, mobile-first YouTube summarizer designed for free hosting/storage tiers, with OpenAI as the only paid API.
 
 ## What it does
 
@@ -8,7 +8,8 @@ A private, mobile-first YouTube summarizer designed to run entirely on free serv
 - Processes videos **one at a time**.
 - Retrieves creator or auto-generated captions first.
 - Aggressively cleans caption noise without intentionally changing meaning.
-- If Vercel cannot fetch YouTube's caption body directly, uses Supadata's free transcript allowance.
+- If Vercel receives an empty YouTube caption body, retries the signed public caption URL through Jina Reader's free, keyless relay.
+- If a video has no captions, attempts chunked audio transcription with OpenAI.
 - Streams an English summary live in a ChatGPT-like dark UI.
 - Summary structure adapts to technical, finance, tutorial, interview, news, educational, or general content.
 - Summary depth: **Concise / Standard / Detailed**; Standard is default.
@@ -25,10 +26,11 @@ A private, mobile-first YouTube summarizer designed to run entirely on free serv
 - Next.js 16 / React 19
 - Vercel Hobby
 - Supabase Free Postgres
-- Gemini API free tier (`gemini-2.5-flash` by default)
-- `gemini-2.5-flash-lite` for free content classification
-- Supadata free tier for transcript fallback
-- `youtubei.js` for direct captions, metadata, and playlists
+- OpenAI Responses API (`gpt-5-mini` by default)
+- `gpt-5-nano` for content classification
+- `gpt-4o-mini-transcribe` for no-caption audio fallback
+- Jina Reader's free, keyless caption relay
+- `youtubei.js` + bundled `ffmpeg-static` for extraction
 
 ## 1. Create Supabase project
 
@@ -52,8 +54,7 @@ npm run dev
 Set these values in `.env.local`:
 
 ```text
-GEMINI_API_KEY=...
-SUPADATA_API_KEY=...
+OPENAI_API_KEY=...
 APP_PIN=...
 SESSION_SECRET=...
 SUPABASE_URL=...
@@ -80,13 +81,16 @@ Use the Cookie header from a YouTube/Google account that is already authorized t
 
 Important: no application can access a private/member video if the YouTube account represented by the cookie is not authorized to view it. YouTube can also block cloud-hosted extraction traffic or change undocumented interfaces; the app reports these failures rather than hiding them.
 
-### Free transcript fallback
+### Free caption fallback
 
-YouTube sometimes advertises captions while withholding their body from Vercel's cloud
-IP addresses. The app first tries YouTube directly, then calls Supadata in `auto` mode.
-Create a free Supadata account and keep `SUPADATA_API_KEY` only in server-side environment
-variables. The free plan has a monthly credit allowance; the application never purchases
-credits or switches to a paid proxy.
+YouTube sometimes advertises captions while withholding their body from Vercel cloud IP
+addresses. The app first tries YouTube directly. If the signed caption URL returns an empty
+body, it retries that public caption URL through `r.jina.ai`. This fallback is free and does
+not require an account or API key. Authenticated/private caption URLs are never relayed.
+
+Jina Reader is an external service and may rate-limit or change availability. The app uses
+it only after direct caption retrieval fails and never sends the OpenAI key, Supabase keys,
+PIN, session secret, or YouTube cookie to it.
 
 ## 4. Deploy on Vercel
 
@@ -108,29 +112,29 @@ The heavy API routes specify a 300-second maximum duration, matching the current
 
 Supabase Free currently provides a 500 MB database. For personal use this should be adequate for a substantial summary library, but raw transcripts are deliberately expired because they are the largest persistent objects.
 
-## Free-tier limits
+## Cost boundaries
 
-The stack does not require billing details, but free tiers are not unlimited. Supadata
-currently grants a monthly transcript credit allowance, and Gemini applies per-project
-request/token limits. When a quota is exhausted the app reports that condition and stops;
-it does not make a paid request. Long videos without native captions consume more
-Supadata credits because the service must generate a transcript.
+Vercel Hobby, Supabase Free, direct YouTube extraction, and the Jina caption relay do not
+require a paid plan. OpenAI is the only paid API. Captioned videos use OpenAI only for
+classification, summarization, and Q&A. Videos without captions may additionally consume
+OpenAI transcription usage if YouTube exposes an audio stream to the deployment.
 
 ## Models
 
 Models are environment-configurable:
 
 ```text
-GEMINI_SUMMARY_MODEL=gemini-2.5-flash
-GEMINI_CLASSIFIER_MODEL=gemini-2.5-flash-lite
+OPENAI_SUMMARY_MODEL=gpt-5-mini
+OPENAI_CLASSIFIER_MODEL=gpt-5-nano
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
 ```
 
-No code change is needed if you want to swap to another compatible Gemini model later.
+No code change is needed if you want to swap to another compatible OpenAI model later.
 
 ## Security notes
 
 - Never commit `.env.local`.
-- Never expose `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `SUPADATA_API_KEY`, `APP_PIN`, `SESSION_SECRET`, or `YOUTUBE_COOKIE` in client code.
+- Never expose `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `APP_PIN`, `SESSION_SECRET`, or `YOUTUBE_COOKIE` in client code.
 - Use a long, non-obvious PIN/password even though the UI calls it a PIN.
 - The session cookie is HTTP-only, SameSite=Lax, and Secure in production.
 - RLS is enabled on both Supabase tables with no public policies; server service-role access is used instead.

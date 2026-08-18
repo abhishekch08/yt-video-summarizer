@@ -42,11 +42,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         });
         controller.enqueue(sse({ type: 'stage', message: 'Writing summary' }));
 
-        const summaryStream = await createSummaryStream(summaryInput, depth, type);
+        const openaiStream = await createSummaryStream(summaryInput, depth, type);
         let full = '';
-        for await (const text of summaryStream) {
-          full += text;
-          controller.enqueue(sse({ type: 'delta', text }));
+        for await (const event of openaiStream) {
+          if (event.type === 'response.output_text.delta') {
+            full += event.delta;
+            controller.enqueue(sse({ type: 'delta', text: event.delta }));
+          } else if (event.type === 'response.failed') {
+            throw new Error(event.response.error?.message || 'OpenAI summary generation failed.');
+          }
         }
         if (!full.trim()) throw new Error('Summary generation returned no text.');
         await saveSummary(id, depth, full);

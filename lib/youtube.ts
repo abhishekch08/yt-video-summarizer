@@ -115,6 +115,20 @@ function selectCaptionTrack(tracks: any[]) {
   return scored[0]?.track || null;
 }
 
+function transcriptFromJson3(body: string) {
+  const data = JSON.parse(body);
+  const pieces: string[] = [];
+  for (const event of data.events || []) {
+    const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
+    if (text.trim()) pieces.push(text);
+  }
+  return cleanTranscript(pieces);
+}
+
+function jinaCaptionUrl(captionUrl: URL) {
+  return `https://r.jina.ai/http://${captionUrl.host}${captionUrl.pathname}${captionUrl.search}`;
+}
+
 async function fetchCaptionText(baseUrl: string) {
   const diagnostics: string[] = [];
   const jsonUrl = new URL(baseUrl);
@@ -125,13 +139,7 @@ async function fetchCaptionText(baseUrl: string) {
     const body = await res.text();
     if (res.ok && body.trim()) {
       try {
-        const data = JSON.parse(body);
-        const pieces: string[] = [];
-        for (const event of data.events || []) {
-          const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
-          if (text.trim()) pieces.push(text);
-        }
-        const cleaned = cleanTranscript(pieces);
+        const cleaned = transcriptFromJson3(body);
         if (cleaned) return cleaned;
       } catch (error) {
         diagnostics.push(`json3 parse: ${safeErrorMessage(error)}`);
@@ -154,6 +162,36 @@ async function fetchCaptionText(baseUrl: string) {
     diagnostics.push(`xml HTTP ${xmlRes.status}, ${xml.length} bytes`);
   } catch (error) {
     diagnostics.push(`xml request: ${safeErrorMessage(error)}`);
+  }
+
+  // YouTube frequently returns an empty caption body to Vercel IPs even though the
+  // signed track URL is valid. Jina Reader is a free, keyless relay; it fetches that
+  // already-authorized public caption URL and returns the JSON as plain text.
+  // Do not relay authenticated caption URLs supplied with a user's YouTube cookie.
+  if (!env.youtubeCookie) {
+    try {
+      const relayRes = await fetch(jinaCaptionUrl(jsonUrl), {
+        headers: { accept: 'text/plain' },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(45_000),
+      });
+      const relayBody = await relayRes.text();
+      if (relayRes.ok && relayBody.trim()) {
+        const marker = relayBody.indexOf('Markdown Content:');
+        const payload = marker >= 0 ? relayBody.slice(marker + 'Markdown Content:'.length) : relayBody;
+        const start = payload.indexOf('{');
+        const end = payload.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+          const cleaned = transcriptFromJson3(payload.slice(start, end + 1));
+          if (cleaned) return cleaned;
+        }
+        diagnostics.push(`free relay returned ${relayBody.length} bytes without usable JSON3 captions`);
+      } else {
+        diagnostics.push(`free relay HTTP ${relayRes.status}, ${relayBody.length} bytes`);
+      }
+    } catch (error) {
+      diagnostics.push(`free relay request: ${safeErrorMessage(error)}`);
+    }
   }
 
   throw new CaptionAccessError(
@@ -301,72 +339,6 @@ async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
   }
 }
 
-type SupadataTranscript = {
-  content?: string | Array<{ text?: string }>;
-  lang?: string;
-  jobId?: string;
-  status?: 'queued' | 'active' | 'completed' | 'failed';
-  error?: unknown;
-  result?: SupadataTranscript;
-};
-
-function supadataError(status: number, body: unknown) {
-  if (status === 401) return new Error('SUPADATA_API_KEY is missing or invalid. Create a free Supadata key and add it to Vercel.');
-  if (status === 429) return new Error('The free Supadata request limit was reached. It will reset with the free plan quota.');
-  if (status === 402) return new Error('The free Supadata credit allowance is exhausted. No paid fallback was attempted.');
-  if (status === 206) return new Error('No existing captions were available and the free transcript service could not produce a transcript.');
-  const value = body as any;
-  const detail = value?.error?.message || value?.error?.details || value?.message;
-  return new Error(`Free transcript fallback failed (HTTP ${status})${detail ? `: ${String(detail)}` : '.'}`);
-}
-
-function transcriptFromSupadata(body: SupadataTranscript) {
-  const value = body.result || body;
-  const content = value.content;
-  if (typeof content === 'string') return cleanTranscript(content);
-  if (Array.isArray(content)) return cleanTranscript(content.map((part) => part.text || ''));
-  return '';
-}
-
-async function supadataRequest(url: string) {
-  const response = await fetch(url, {
-    headers: { 'x-api-key': env.supadataApiKey, accept: 'application/json' },
-    cache: 'no-store',
-  });
-  const body = await response.json().catch(() => ({})) as SupadataTranscript;
-  if (response.status === 206 || !response.ok) throw supadataError(response.status, body);
-  return { response, body };
-}
-
-async function fetchFreeTranscript(inputUrl: string) {
-  const url = new URL('https://api.supadata.ai/v1/transcript');
-  url.searchParams.set('url', inputUrl);
-  url.searchParams.set('lang', 'en');
-  url.searchParams.set('text', 'true');
-  url.searchParams.set('mode', 'auto');
-
-  const { response, body } = await supadataRequest(url.toString());
-  let result = body;
-
-  if (response.status === 202 || body.jobId) {
-    if (!body.jobId) throw new Error('The free transcript service started a job without returning its ID.');
-    const deadline = Date.now() + 240_000;
-    const jobUrl = `https://api.supadata.ai/v1/transcript/${encodeURIComponent(body.jobId)}`;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-      const polled = await supadataRequest(jobUrl);
-      result = polled.body;
-      if (result.status === 'failed') throw new Error('The free transcript service could not process this video.');
-      if (result.status === 'completed') break;
-    }
-    if (result.status !== 'completed') throw new Error('The free transcript service did not finish before the deployment timeout.');
-  }
-
-  const transcript = transcriptFromSupadata(result);
-  if (!transcript) throw new Error('The free transcript service returned an empty transcript.');
-  return { transcript, language: (result.result || result).lang };
-}
-
 async function fetchOEmbedMetadata(inputUrl: string, videoId: string): Promise<YoutubeMetadata> {
   try {
     const url = new URL('https://www.youtube.com/oembed');
@@ -423,17 +395,50 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
     || (pageError instanceof CaptionAccessError ? pageError.metadata : undefined)
     || await fetchOEmbedMetadata(inputUrl, videoId);
 
-  try {
-    const fallback = await fetchFreeTranscript(metadata.url);
-    return { metadata, transcript: fallback.transcript, captionLanguage: fallback.language };
-  } catch (error) {
-    const directFailures = [innerError, pageError]
-      .filter(Boolean)
-      .map((failure) => safeErrorMessage(failure))
-      .join(' | ');
-    console.error(`[free-transcript] video=${videoId}`, { directFailures, fallback: safeErrorMessage(error) });
-    throw error;
+  if (innerResult || pageResult) return innerResult || pageResult!;
+
+  if (innerError instanceof CaptionAccessError || pageError instanceof CaptionAccessError) {
+    const diagnostics = [innerError, pageError]
+      .filter((error): error is CaptionAccessError => error instanceof CaptionAccessError)
+      .flatMap((error) => error.diagnostics);
+    console.error(`[youtube-captions] video=${videoId}`, diagnostics);
+    throw new Error('YouTube captions were detected, but both direct access and the free caption relay failed. Please retry shortly.');
   }
+
+  const failures = [innerError, pageError].filter(Boolean).map(safeErrorMessage).join(' | ');
+  if (failures) console.error(`[youtube-access] video=${videoId}`, failures);
+  return { metadata, transcript: null };
+}
+
+export async function fetchAudioFormat(videoUrl: string) {
+  const videoId = extractYoutubeId(videoUrl);
+  if (!videoId) throw new Error('Invalid YouTube video URL');
+  const youtube = await getYoutubeClient();
+  const clients = ['IOS', 'ANDROID_VR', 'TV', 'WEB_EMBEDDED', 'WEB'] as const;
+  const failures: string[] = [];
+
+  for (const client of clients) {
+    try {
+      const format: any = await youtube.getStreamingData(videoId, {
+        type: 'audio',
+        quality: 'best',
+        client,
+      } as any);
+      if (format?.url) {
+        return {
+          url: format.url,
+          mimeType: format.mime_type || 'audio/webm',
+          durationSeconds: null,
+        };
+      }
+      failures.push(`${client}: no URL`);
+    } catch (error) {
+      failures.push(`${client}: ${safeErrorMessage(error)}`);
+    }
+  }
+
+  console.error(`[youtube-audio] video=${videoId}`, failures);
+  throw new Error('YouTube did not provide a downloadable audio stream. This video has no usable captions, so automatic transcription cannot continue from this deployment.');
 }
 
 function walkForPlaylistIds(node: unknown, out: string[]) {
