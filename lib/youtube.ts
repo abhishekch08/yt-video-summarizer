@@ -1,7 +1,7 @@
-import { Innertube, Platform, Types, UniversalCache } from 'youtubei.js';
+import { Innertube, UniversalCache } from 'youtubei.js';
+import { ProxyAgent, type Dispatcher } from 'undici';
 import { env } from '@/lib/env';
 import { cleanTranscript, decodeHtml } from '@/lib/text';
-import { mintYoutubeContentPoToken } from '@/lib/youtube-potoken';
 
 export interface YoutubeMetadata {
   videoId: string;
@@ -19,9 +19,39 @@ export interface CaptionResult {
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
 
-// Current YouTube.js uses its platform shim when deciphering protected media URLs.
-// The official BgUtils + YouTube.js Node example provides an eval implementation.
-Platform.shim.eval = async (data: Types.BuildScriptResult) => new Function(data.output)();
+class CaptionAccessError extends Error {
+  constructor(message: string, readonly diagnostics: string[]) {
+    super(message);
+    this.name = 'CaptionAccessError';
+  }
+}
+
+let proxyAgent: ProxyAgent | null | undefined;
+
+function getProxyAgent() {
+  if (proxyAgent !== undefined) return proxyAgent;
+  proxyAgent = env.youtubeProxyUrl ? new ProxyAgent(env.youtubeProxyUrl) : null;
+  return proxyAgent;
+}
+
+function youtubeFetch(input: string | URL | Request, init?: RequestInit) {
+  const dispatcher = getProxyAgent();
+  if (!dispatcher) return fetch(input, init);
+  return fetch(input, { ...init, dispatcher } as RequestInit & { dispatcher: Dispatcher });
+}
+
+function safeErrorMessage(error: unknown) {
+  let message = error instanceof Error ? error.message : String(error);
+  const proxyUrl = env.youtubeProxyUrl;
+  if (proxyUrl) message = message.replaceAll(proxyUrl, '[proxy]');
+  return message;
+}
+
+function proxyHint() {
+  return env.youtubeProxyUrl
+    ? ' The configured YouTube proxy was also unable to complete the request.'
+    : ' Configure YOUTUBE_PROXY_URL with a trusted proxy whose egress is not blocked by YouTube.';
+}
 
 function requestHeaders() {
   const headers: Record<string, string> = {
@@ -80,7 +110,7 @@ function extractAssignedJson(html: string, marker: string) {
 
 async function fetchWatchPage(videoId: string) {
   const url = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en&bpctr=9999999999`;
-  const res = await fetch(url, { headers: requestHeaders(), cache: 'no-store' });
+  const res = await youtubeFetch(url, { headers: requestHeaders(), cache: 'no-store' });
   if (!res.ok) throw new Error(`YouTube watch page returned HTTP ${res.status}`);
   return res.text();
 }
@@ -102,27 +132,50 @@ function selectCaptionTrack(tracks: any[]) {
 }
 
 async function fetchCaptionText(baseUrl: string) {
-  const jsonUrl = baseUrl.includes('fmt=') ? baseUrl.replace(/([?&])fmt=[^&]*/i, '$1fmt=json3') : `${baseUrl}&fmt=json3`;
-  const res = await fetch(jsonUrl, { headers: requestHeaders(), cache: 'no-store' });
-  if (res.ok) {
+  const diagnostics: string[] = [];
+  const jsonUrl = new URL(baseUrl);
+  jsonUrl.searchParams.set('fmt', 'json3');
+
+  try {
+    const res = await youtubeFetch(jsonUrl, { headers: requestHeaders(), cache: 'no-store' });
     const body = await res.text();
-    try {
-      const data = JSON.parse(body);
-      const pieces: string[] = [];
-      for (const event of data.events || []) {
-        const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
-        if (text.trim()) pieces.push(text);
+    if (res.ok && body.trim()) {
+      try {
+        const data = JSON.parse(body);
+        const pieces: string[] = [];
+        for (const event of data.events || []) {
+          const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
+          if (text.trim()) pieces.push(text);
+        }
+        const cleaned = cleanTranscript(pieces);
+        if (cleaned) return cleaned;
+      } catch (error) {
+        diagnostics.push(`json3 parse: ${safeErrorMessage(error)}`);
       }
-      const cleaned = cleanTranscript(pieces);
-      if (cleaned) return cleaned;
-    } catch {}
+    } else {
+      diagnostics.push(`json3 HTTP ${res.status}, ${body.length} bytes`);
+    }
+  } catch (error) {
+    diagnostics.push(`json3 request: ${safeErrorMessage(error)}`);
   }
 
-  const xmlRes = await fetch(baseUrl, { headers: requestHeaders(), cache: 'no-store' });
-  if (!xmlRes.ok) throw new Error(`Caption fetch returned HTTP ${xmlRes.status}`);
-  const xml = await xmlRes.text();
-  const pieces = Array.from(xml.matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g)).map((m) => decodeHtml(m[1]));
-  return cleanTranscript(pieces);
+  try {
+    const xmlRes = await youtubeFetch(baseUrl, { headers: requestHeaders(), cache: 'no-store' });
+    const xml = await xmlRes.text();
+    if (xmlRes.ok && xml.trim()) {
+      const pieces = Array.from(xml.matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g)).map((m) => decodeHtml(m[1]));
+      const cleaned = cleanTranscript(pieces);
+      if (cleaned) return cleaned;
+    }
+    diagnostics.push(`xml HTTP ${xmlRes.status}, ${xml.length} bytes`);
+  } catch (error) {
+    diagnostics.push(`xml request: ${safeErrorMessage(error)}`);
+  }
+
+  throw new CaptionAccessError(
+    `YouTube advertised captions for this video but did not return the caption text.${proxyHint()}`,
+    diagnostics,
+  );
 }
 
 let youtubeClient: Promise<Innertube> | null = null;
@@ -133,115 +186,98 @@ async function getYoutubeClient() {
       cookie: env.youtubeCookie,
       cache: new UniversalCache(false),
       generate_session_locally: true,
+      fetch: youtubeFetch,
     });
   }
   return youtubeClient;
 }
 
-function metadataFromInfo(videoId: string, info: any): YoutubeMetadata {
-  const basic = info?.basic_info || {};
-  const duration = Number(basic.duration);
-  return {
-    videoId,
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    title: basic.title || `YouTube video ${videoId}`,
-    channel: basic.channel?.name || basic.author || null,
-    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : null,
-  };
-}
-
-function assertPlayable(info: any, prefix: string) {
-  const playability = info?.playability_status;
-  if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
-    const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
-    throw new Error(`${prefix}: ${reason}`);
-  }
-}
-
-async function transcriptFromInfo(info: any, metadata: YoutubeMetadata): Promise<CaptionResult | null> {
-  const directTracks: any[] = info.captions?.caption_tracks || [];
-  if (directTracks.length) {
-    const track = selectCaptionTrack(directTracks);
-    const baseUrl = track?.base_url || track?.baseUrl;
-    if (baseUrl) {
-      try {
-        const transcript = await fetchCaptionText(baseUrl);
-        if (transcript) {
-          return {
-            metadata,
-            transcript,
-            captionLanguage: track.language_code || track.languageCode || undefined,
-          };
-        }
-      } catch {
-        // Continue to the engagement-panel transcript API.
-      }
-    }
-  }
-
-  try {
-    let transcriptInfo: any = await info.getTranscript();
-    const english = (transcriptInfo.languages || []).find((name: string) => /^english\b/i.test(name));
-    if (english && !/^english\b/i.test(transcriptInfo.selectedLanguage || '')) {
-      try { transcriptInfo = await transcriptInfo.selectLanguage(english); } catch {}
-    }
-
-    const segments: any[] = transcriptInfo.transcript?.content?.body?.initial_segments || [];
-    const pieces = segments
-      .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
-      .filter((text: string) => text.trim());
-    const transcript = cleanTranscript(pieces);
-    if (transcript) {
-      return {
-        metadata,
-        transcript,
-        captionLanguage: transcriptInfo.selectedLanguage || undefined,
-      };
-    }
-  } catch {
-    // A video may genuinely have no searchable transcript panel.
-  }
-
-  return null;
-}
-
 async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
   const youtube = await getYoutubeClient();
-  const info: any = await youtube.getInfo(videoId);
-  assertPlayable(info, 'YouTube internal API access error');
-
-  const metadata = metadataFromInfo(videoId, info);
-  const captionResult = await transcriptFromInfo(info, metadata);
-  if (captionResult) return captionResult;
-
-  if (metadata.title === `YouTube video ${videoId}` && metadata.durationSeconds === null) {
-    throw new Error('YouTube internal API returned no usable video metadata');
-  }
-  return { metadata, transcript: null };
-}
-
-async function fetchViaPoToken(videoId: string): Promise<CaptionResult> {
-  const youtube = await getYoutubeClient();
-  const poToken = await mintYoutubeContentPoToken(videoId);
-  const clients = ['YTMUSIC', 'WEB', 'WEB_EMBEDDED'] as const;
+  const clients = ['WEB', 'IOS'] as const;
+  let fallbackMetadata: YoutubeMetadata | null = null;
   const failures: string[] = [];
-  let bestMetadata: YoutubeMetadata | null = null;
 
   for (const client of clients) {
     try {
-      const info: any = await youtube.getInfo(videoId, { client, po_token: poToken } as any);
-      assertPlayable(info, `${client} protected player`);
-      const metadata = metadataFromInfo(videoId, info);
-      if (!bestMetadata || metadata.durationSeconds) bestMetadata = metadata;
-      const captionResult = await transcriptFromInfo(info, metadata);
-      if (captionResult) return captionResult;
+      const info: any = await youtube.getInfo(videoId, { client });
+      const playability = info.playability_status;
+      if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
+        const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
+        throw new Error(`YouTube internal API access error: ${reason}`);
+      }
+
+      const basic = info.basic_info || {};
+      const metadata: YoutubeMetadata = {
+        videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title: basic.title || `YouTube video ${videoId}`,
+        channel: basic.channel?.name || basic.author || null,
+        durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
+      };
+      if (basic.title || metadata.durationSeconds !== null) fallbackMetadata = metadata;
+
+      const directTracks: any[] = info.captions?.caption_tracks || [];
+      if (directTracks.length) {
+        const track = selectCaptionTrack(directTracks);
+        const baseUrl = track?.base_url || track?.baseUrl;
+        if (baseUrl) {
+          try {
+            const transcript = await fetchCaptionText(baseUrl);
+            return {
+              metadata,
+              transcript,
+              captionLanguage: track.language_code || track.languageCode || undefined,
+            };
+          } catch (error) {
+            if (error instanceof CaptionAccessError) {
+              failures.push(`${client} captions: ${error.diagnostics.join(', ')}`);
+            } else {
+              failures.push(`${client} captions: ${safeErrorMessage(error)}`);
+            }
+          }
+        }
+      }
+
+      if (client === 'WEB') {
+        try {
+          let transcriptInfo: any = await info.getTranscript();
+          const english = (transcriptInfo.languages || []).find((name: string) => /^english\b/i.test(name));
+          if (english && !/^english\b/i.test(transcriptInfo.selectedLanguage || '')) {
+            try { transcriptInfo = await transcriptInfo.selectLanguage(english); } catch {}
+          }
+
+          const segments: any[] = transcriptInfo.transcript?.content?.body?.initial_segments || [];
+          const pieces = segments
+            .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
+            .filter((text: string) => text.trim());
+          const transcript = cleanTranscript(pieces);
+          if (transcript) {
+            return {
+              metadata,
+              transcript,
+              captionLanguage: transcriptInfo.selectedLanguage || undefined,
+            };
+          }
+        } catch (error) {
+          failures.push(`WEB transcript API: ${safeErrorMessage(error)}`);
+        }
+      }
     } catch (error) {
-      failures.push(`${client}: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${client} player: ${safeErrorMessage(error)}`);
     }
   }
 
-  if (bestMetadata) return { metadata: bestMetadata, transcript: null };
-  throw new Error(`Protected YouTube player returned no usable metadata. ${failures.join(' | ')}`);
+  if (failures.some((failure) => failure.includes('captions:'))) {
+    console.error(`[youtube-captions] video=${videoId}`, failures);
+    throw new CaptionAccessError(
+      `YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`,
+      failures,
+    );
+  }
+
+  if (fallbackMetadata) return { metadata: fallbackMetadata, transcript: null };
+  throw new Error(`YouTube internal API returned no usable video metadata. ${failures.join(' | ')}`);
 }
 
 async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
@@ -255,7 +291,7 @@ async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
     url: `https://www.youtube.com/watch?v=${videoId}`,
     title: vd.title || `YouTube video ${videoId}`,
     channel: vd.author || null,
-    durationSeconds: Number.isFinite(Number(vd.lengthSeconds)) && Number(vd.lengthSeconds) > 0 ? Number(vd.lengthSeconds) : null,
+    durationSeconds: Number.isFinite(Number(vd.lengthSeconds)) ? Number(vd.lengthSeconds) : null,
   };
 
   const playability = player.playabilityStatus;
@@ -277,82 +313,46 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
   const videoId = extractYoutubeId(inputUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
 
-  const failures: string[] = [];
-  let normalResult: CaptionResult | null = null;
-
+  let innerResult: CaptionResult | null = null;
+  let innerError: unknown = null;
   try {
-    normalResult = await fetchViaInnertube(videoId);
-    if (normalResult.transcript) return normalResult;
+    innerResult = await fetchViaInnertube(videoId);
+    if (innerResult.transcript) return innerResult;
   } catch (error) {
-    failures.push(`Internal API: ${error instanceof Error ? error.message : String(error)}`);
+    innerError = error;
   }
 
-  // If normal caption discovery did not succeed, retry through a current content-bound
-  // WebPO token before declaring the video captionless or moving to audio transcription.
   try {
-    const protectedResult = await fetchViaPoToken(videoId);
-    if (protectedResult.transcript) return protectedResult;
-    if (protectedResult.metadata.durationSeconds) return protectedResult;
-  } catch (error) {
-    failures.push(`PoToken player: ${error instanceof Error ? error.message : String(error)}`);
+    const pageResult = await fetchViaWatchPage(videoId);
+    if (pageResult.transcript) return pageResult;
+    return innerResult || pageResult;
+  } catch (pageError) {
+    if (pageError instanceof CaptionAccessError) {
+      console.error(`[youtube-captions-page] video=${videoId}`, pageError.diagnostics);
+    }
+    if (innerError instanceof CaptionAccessError || pageError instanceof CaptionAccessError) {
+      throw new Error(`YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`);
+    }
+    if (innerResult) return innerResult;
+
+    const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
+    const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
+    throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
   }
-
-  if (normalResult?.metadata.durationSeconds) return normalResult;
-
-  try {
-    return await fetchViaWatchPage(videoId);
-  } catch (error) {
-    failures.push(`Watch page: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  throw new Error(`YouTube access failed. ${failures.join(' | ')}`);
 }
 
 export async function fetchAudioFormat(videoUrl: string) {
   const videoId = extractYoutubeId(videoUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
   const youtube = await getYoutubeClient();
+
+  // YouTube increasingly applies different playback requirements to different InnerTube
+  // clients. A normal WEB metadata request can succeed while its streamingData is omitted.
+  // Retry a small set of official clients before treating the video as non-downloadable.
+  const clients = ['IOS', 'ANDROID_VR', 'TV', 'WEB_EMBEDDED', 'WEB'] as const;
   const failures: string[] = [];
 
-  // Primary path: YouTube's current WebPO flow. BgUtils' current reference example
-  // mints a token bound to the video ID, requests player data, deciphers the chosen
-  // audio format, then appends the same token to the media URL.
-  try {
-    const poToken = await mintYoutubeContentPoToken(videoId);
-    const protectedClients = ['YTMUSIC', 'WEB', 'WEB_EMBEDDED'] as const;
-
-    for (const client of protectedClients) {
-      try {
-        const info: any = await youtube.getBasicInfo(videoId, { client, po_token: poToken } as any);
-        assertPlayable(info, `${client} protected player`);
-        if (!info.streaming_data) throw new Error('Streaming data not available');
-
-        const format: any = info.chooseFormat({
-          quality: 'best',
-          type: 'audio',
-        });
-        let url = await format.decipher(youtube.session.player);
-        if (!url) throw new Error('Audio URL decipher returned empty result');
-        const separator = url.includes('?') ? '&' : '?';
-        if (!/[?&]pot=/.test(url)) url = `${url}${separator}pot=${encodeURIComponent(poToken)}`;
-
-        return {
-          url,
-          mimeType: format.mime_type || 'audio/webm',
-          durationSeconds: null,
-        };
-      } catch (error) {
-        failures.push(`${client}+PoToken: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-  } catch (error) {
-    failures.push(`PoToken: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  // Secondary compatibility path. Some videos/regions still expose media data without
-  // WebPO on another official InnerTube client, so retain these cheap fallbacks.
-  const legacyClients = ['WEB', 'ANDROID_VR', 'IOS', 'TV', 'WEB_EMBEDDED'] as const;
-  for (const client of legacyClients) {
+  for (const client of clients) {
     try {
       const format: any = await youtube.getStreamingData(videoId, {
         type: 'audio',
@@ -368,11 +368,13 @@ export async function fetchAudioFormat(videoUrl: string) {
       }
       failures.push(`${client}: no URL`);
     } catch (error) {
-      failures.push(`${client}: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push(`${client}: ${message}`);
     }
   }
 
-  throw new Error(`No downloadable YouTube audio stream was available. ${failures.join(' | ')}`);
+  console.error(`[youtube-audio] video=${videoId}`, failures);
+  throw new Error(`YouTube did not provide a downloadable audio stream to this deployment.${proxyHint()}`);
 }
 
 function walkForPlaylistIds(node: unknown, out: string[]) {
@@ -406,7 +408,7 @@ async function expandPlaylistWithInnertube(listId: string) {
 
 async function expandPlaylistFromPage(listId: string) {
   const playlistUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}&hl=en`;
-  const res = await fetch(playlistUrl, { headers: requestHeaders(), cache: 'no-store' });
+  const res = await youtubeFetch(playlistUrl, { headers: requestHeaders(), cache: 'no-store' });
   if (!res.ok) throw new Error(`Playlist fetch returned HTTP ${res.status}`);
   const html = await res.text();
   const initial = extractAssignedJson(html, 'ytInitialData');
@@ -428,6 +430,8 @@ export async function expandPlaylist(inputUrl: string) {
   try {
     ids = await expandPlaylistWithInnertube(listId);
   } catch {
+    // Keep an independent page-parser fallback so a library/parser regression does not
+    // make all playlist URLs unusable at once.
     ids = await expandPlaylistFromPage(listId);
   }
 

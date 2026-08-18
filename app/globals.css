@@ -85,9 +85,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .queue-status.working { color: #ddd; }
 .queue-status.done { color: var(--ok); border-color: #335441; }
 .queue-status.error { color: #f89b9b; border-color: #613939; }
-.queue-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.queue-copy { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 3px; }
 .queue-copy > span { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .queue-copy small { color: #757575; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.queue-row.error { align-items: flex-start; }
+.queue-row.error .queue-copy small { color: #c98282; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; line-height: 1.45; }
 
 .summary-view { width: min(930px, calc(100% - 52px)); margin: 0 auto; padding: 38px 0 90px; }
 .summary-topbar { display: flex; align-items: flex-start; gap: 18px; justify-content: space-between; padding-bottom: 19px; border-bottom: 1px solid #242424; }
