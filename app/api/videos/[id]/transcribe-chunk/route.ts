@@ -23,7 +23,13 @@ function runFfmpeg(args: string[]) {
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`Audio conversion failed${stderr ? `: ${stderr.slice(-1200)}` : ''}`));
+      else {
+        const safeDetail = stderr
+          .slice(-1200)
+          .replace(/https?:\/\/\S+/gi, '[redacted URL]')
+          .replace(env.youtubeProxyUrl || /$^/, '[redacted proxy]');
+        reject(new Error(`Audio conversion failed${safeDetail ? `: ${safeDetail}` : ''}`));
+      }
     });
   });
 }
@@ -49,10 +55,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     const audio = await fetchAudioFormat(video.url);
     outputPath = path.join(os.tmpdir(), `yt-${id}-${index}-${Date.now()}.mp3`);
+    const proxyArgs = env.youtubeProxyUrl ? ['-http_proxy', env.youtubeProxyUrl] : [];
     await runFfmpeg([
       '-hide_banner', '-loglevel', 'error',
       '-ss', String(start),
       '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+      ...proxyArgs,
       '-i', audio.url,
       '-t', String(duration),
       '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',

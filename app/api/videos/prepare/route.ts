@@ -9,15 +9,24 @@ export const maxDuration = 300;
 const AUDIO_CHUNK_SECONDS = 8 * 60;
 
 function readableError(error: unknown) {
-  if (error instanceof Error) return error.message;
+  const clean = (value: string) => value.split(/\r?\n/, 1)[0].trim().slice(0, 500);
+  const normalize = (value: string) => {
+    const message = clean(value);
+    if (/fetch failed/i.test(message)) {
+      return 'A backend network request failed. Check the deployment network and service environment variables.';
+    }
+    return message;
+  };
+
+  if (error instanceof Error) return normalize(error.message);
   if (error && typeof error === 'object') {
     const value = error as Record<string, unknown>;
-    const parts = [value.message, value.details, value.hint, value.code]
-      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
+    const parts = [value.message, value.hint, value.code]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .map(normalize);
     if (parts.length) return parts.join(' | ');
-    try { return JSON.stringify(error); } catch {}
   }
-  if (typeof error === 'string' && error.trim()) return error;
+  if (typeof error === 'string' && error.trim()) return normalize(error);
   return 'Could not prepare video';
 }
 

@@ -431,7 +431,7 @@ export default function AppShell({ initialAuthenticated }: { initialAuthenticate
                 </div>
                 <div className="queue-list">
                   {queue.map((item, i) => (
-                    <div className="queue-row" key={`${item.url}-${i}`}>
+                    <div className={`queue-row ${item.status}`} key={`${item.url}-${i}`}>
                       <div className={`queue-status ${item.status}`}>
                         {item.status === 'working' ? <LoaderCircle className="spin" size={15} /> : item.status === 'done' ? <Check size={15} /> : item.status === 'error' ? <X size={15} /> : <span>{i + 1}</span>}
                       </div>

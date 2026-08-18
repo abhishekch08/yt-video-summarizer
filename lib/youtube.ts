@@ -1,4 +1,5 @@
 import { Innertube, UniversalCache } from 'youtubei.js';
+import { ProxyAgent, type Dispatcher } from 'undici';
 import { env } from '@/lib/env';
 import { cleanTranscript, decodeHtml } from '@/lib/text';
 
@@ -17,6 +18,40 @@ export interface CaptionResult {
 }
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36';
+
+class CaptionAccessError extends Error {
+  constructor(message: string, readonly diagnostics: string[]) {
+    super(message);
+    this.name = 'CaptionAccessError';
+  }
+}
+
+let proxyAgent: ProxyAgent | null | undefined;
+
+function getProxyAgent() {
+  if (proxyAgent !== undefined) return proxyAgent;
+  proxyAgent = env.youtubeProxyUrl ? new ProxyAgent(env.youtubeProxyUrl) : null;
+  return proxyAgent;
+}
+
+function youtubeFetch(input: string | URL | Request, init?: RequestInit) {
+  const dispatcher = getProxyAgent();
+  if (!dispatcher) return fetch(input, init);
+  return fetch(input, { ...init, dispatcher } as RequestInit & { dispatcher: Dispatcher });
+}
+
+function safeErrorMessage(error: unknown) {
+  let message = error instanceof Error ? error.message : String(error);
+  const proxyUrl = env.youtubeProxyUrl;
+  if (proxyUrl) message = message.replaceAll(proxyUrl, '[proxy]');
+  return message;
+}
+
+function proxyHint() {
+  return env.youtubeProxyUrl
+    ? ' The configured YouTube proxy was also unable to complete the request.'
+    : ' Configure YOUTUBE_PROXY_URL with a trusted proxy whose egress is not blocked by YouTube.';
+}
 
 function requestHeaders() {
   const headers: Record<string, string> = {
@@ -75,7 +110,7 @@ function extractAssignedJson(html: string, marker: string) {
 
 async function fetchWatchPage(videoId: string) {
   const url = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=en&bpctr=9999999999`;
-  const res = await fetch(url, { headers: requestHeaders(), cache: 'no-store' });
+  const res = await youtubeFetch(url, { headers: requestHeaders(), cache: 'no-store' });
   if (!res.ok) throw new Error(`YouTube watch page returned HTTP ${res.status}`);
   return res.text();
 }
@@ -97,27 +132,50 @@ function selectCaptionTrack(tracks: any[]) {
 }
 
 async function fetchCaptionText(baseUrl: string) {
-  const jsonUrl = baseUrl.includes('fmt=') ? baseUrl.replace(/([?&])fmt=[^&]*/i, '$1fmt=json3') : `${baseUrl}&fmt=json3`;
-  const res = await fetch(jsonUrl, { headers: requestHeaders(), cache: 'no-store' });
-  if (res.ok) {
+  const diagnostics: string[] = [];
+  const jsonUrl = new URL(baseUrl);
+  jsonUrl.searchParams.set('fmt', 'json3');
+
+  try {
+    const res = await youtubeFetch(jsonUrl, { headers: requestHeaders(), cache: 'no-store' });
     const body = await res.text();
-    try {
-      const data = JSON.parse(body);
-      const pieces: string[] = [];
-      for (const event of data.events || []) {
-        const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
-        if (text.trim()) pieces.push(text);
+    if (res.ok && body.trim()) {
+      try {
+        const data = JSON.parse(body);
+        const pieces: string[] = [];
+        for (const event of data.events || []) {
+          const text = (event.segs || []).map((seg: any) => seg.utf8 || '').join('');
+          if (text.trim()) pieces.push(text);
+        }
+        const cleaned = cleanTranscript(pieces);
+        if (cleaned) return cleaned;
+      } catch (error) {
+        diagnostics.push(`json3 parse: ${safeErrorMessage(error)}`);
       }
-      const cleaned = cleanTranscript(pieces);
-      if (cleaned) return cleaned;
-    } catch {}
+    } else {
+      diagnostics.push(`json3 HTTP ${res.status}, ${body.length} bytes`);
+    }
+  } catch (error) {
+    diagnostics.push(`json3 request: ${safeErrorMessage(error)}`);
   }
 
-  const xmlRes = await fetch(baseUrl, { headers: requestHeaders(), cache: 'no-store' });
-  if (!xmlRes.ok) throw new Error(`Caption fetch returned HTTP ${xmlRes.status}`);
-  const xml = await xmlRes.text();
-  const pieces = Array.from(xml.matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g)).map((m) => decodeHtml(m[1]));
-  return cleanTranscript(pieces);
+  try {
+    const xmlRes = await youtubeFetch(baseUrl, { headers: requestHeaders(), cache: 'no-store' });
+    const xml = await xmlRes.text();
+    if (xmlRes.ok && xml.trim()) {
+      const pieces = Array.from(xml.matchAll(/<text\b[^>]*>([\s\S]*?)<\/text>/g)).map((m) => decodeHtml(m[1]));
+      const cleaned = cleanTranscript(pieces);
+      if (cleaned) return cleaned;
+    }
+    diagnostics.push(`xml HTTP ${xmlRes.status}, ${xml.length} bytes`);
+  } catch (error) {
+    diagnostics.push(`xml request: ${safeErrorMessage(error)}`);
+  }
+
+  throw new CaptionAccessError(
+    `YouTube advertised captions for this video but did not return the caption text.${proxyHint()}`,
+    diagnostics,
+  );
 }
 
 let youtubeClient: Promise<Innertube> | null = null;
@@ -128,6 +186,7 @@ async function getYoutubeClient() {
       cookie: env.youtubeCookie,
       cache: new UniversalCache(false),
       generate_session_locally: true,
+      fetch: youtubeFetch,
     });
   }
   return youtubeClient;
@@ -135,75 +194,90 @@ async function getYoutubeClient() {
 
 async function fetchViaInnertube(videoId: string): Promise<CaptionResult> {
   const youtube = await getYoutubeClient();
-  const info: any = await youtube.getInfo(videoId);
+  const clients = ['WEB', 'IOS'] as const;
+  let fallbackMetadata: YoutubeMetadata | null = null;
+  const failures: string[] = [];
 
-  const playability = info.playability_status;
-  if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
-    const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
-    throw new Error(`YouTube internal API access error: ${reason}`);
-  }
-
-  const basic = info.basic_info || {};
-  const metadata: YoutubeMetadata = {
-    videoId,
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    title: basic.title || `YouTube video ${videoId}`,
-    channel: basic.channel?.name || basic.author || null,
-    durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
-  };
-
-  // The player response often exposes caption tracks even when the separate transcript
-  // engagement-panel endpoint is unavailable. Prefer these direct timed-text URLs first.
-  const directTracks: any[] = info.captions?.caption_tracks || [];
-  if (directTracks.length) {
-    const track = selectCaptionTrack(directTracks);
-    const baseUrl = track?.base_url || track?.baseUrl;
-    if (baseUrl) {
-      try {
-        const transcript = await fetchCaptionText(baseUrl);
-        if (transcript) {
-          return {
-            metadata,
-            transcript,
-            captionLanguage: track.language_code || track.languageCode || undefined,
-          };
-        }
-      } catch {
-        // Fall through to the transcript engagement-panel API below.
+  for (const client of clients) {
+    try {
+      const info: any = await youtube.getInfo(videoId, { client });
+      const playability = info.playability_status;
+      if (playability?.status && !['OK', 'LIVE_STREAM_OFFLINE'].includes(playability.status)) {
+        const reason = playability.reason || playability.messages?.join?.(' ') || playability.status;
+        throw new Error(`YouTube internal API access error: ${reason}`);
       }
-    }
-  }
 
-  try {
-    let transcriptInfo: any = await info.getTranscript();
-    const english = (transcriptInfo.languages || []).find((name: string) => /^english\b/i.test(name));
-    if (english && !/^english\b/i.test(transcriptInfo.selectedLanguage || '')) {
-      try { transcriptInfo = await transcriptInfo.selectLanguage(english); } catch {}
-    }
-
-    const segments: any[] = transcriptInfo.transcript?.content?.body?.initial_segments || [];
-    const pieces = segments
-      .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
-      .filter((text: string) => text.trim());
-    const transcript = cleanTranscript(pieces);
-    if (transcript) {
-      return {
-        metadata,
-        transcript,
-        captionLanguage: transcriptInfo.selectedLanguage || undefined,
+      const basic = info.basic_info || {};
+      const metadata: YoutubeMetadata = {
+        videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title: basic.title || `YouTube video ${videoId}`,
+        channel: basic.channel?.name || basic.author || null,
+        durationSeconds: Number.isFinite(Number(basic.duration)) ? Number(basic.duration) : null,
       };
+      if (basic.title || metadata.durationSeconds !== null) fallbackMetadata = metadata;
+
+      const directTracks: any[] = info.captions?.caption_tracks || [];
+      if (directTracks.length) {
+        const track = selectCaptionTrack(directTracks);
+        const baseUrl = track?.base_url || track?.baseUrl;
+        if (baseUrl) {
+          try {
+            const transcript = await fetchCaptionText(baseUrl);
+            return {
+              metadata,
+              transcript,
+              captionLanguage: track.language_code || track.languageCode || undefined,
+            };
+          } catch (error) {
+            if (error instanceof CaptionAccessError) {
+              failures.push(`${client} captions: ${error.diagnostics.join(', ')}`);
+            } else {
+              failures.push(`${client} captions: ${safeErrorMessage(error)}`);
+            }
+          }
+        }
+      }
+
+      if (client === 'WEB') {
+        try {
+          let transcriptInfo: any = await info.getTranscript();
+          const english = (transcriptInfo.languages || []).find((name: string) => /^english\b/i.test(name));
+          if (english && !/^english\b/i.test(transcriptInfo.selectedLanguage || '')) {
+            try { transcriptInfo = await transcriptInfo.selectLanguage(english); } catch {}
+          }
+
+          const segments: any[] = transcriptInfo.transcript?.content?.body?.initial_segments || [];
+          const pieces = segments
+            .map((segment: any) => segment?.snippet?.toString?.() || String(segment?.snippet || ''))
+            .filter((text: string) => text.trim());
+          const transcript = cleanTranscript(pieces);
+          if (transcript) {
+            return {
+              metadata,
+              transcript,
+              captionLanguage: transcriptInfo.selectedLanguage || undefined,
+            };
+          }
+        } catch (error) {
+          failures.push(`WEB transcript API: ${safeErrorMessage(error)}`);
+        }
+      }
+    } catch (error) {
+      failures.push(`${client} player: ${safeErrorMessage(error)}`);
     }
-  } catch {
-    // Continue to the normal no-caption/audio-transcription path below.
   }
 
-  // An empty player response usually means YouTube challenged the cloud request. Do not
-  // report that as a genuine no-caption video; throw so the watch-page fallback is tried.
-  if (!basic.title && metadata.durationSeconds === null) {
-    throw new Error('YouTube internal API returned no usable video metadata');
+  if (failures.some((failure) => failure.includes('captions:'))) {
+    console.error(`[youtube-captions] video=${videoId}`, failures);
+    throw new CaptionAccessError(
+      `YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`,
+      failures,
+    );
   }
 
-  return { metadata, transcript: null };
+  if (fallbackMetadata) return { metadata: fallbackMetadata, transcript: null };
+  throw new Error(`YouTube internal API returned no usable video metadata. ${failures.join(' | ')}`);
 }
 
 async function fetchViaWatchPage(videoId: string): Promise<CaptionResult> {
@@ -239,18 +313,31 @@ export async function fetchCaptionsAndMetadata(inputUrl: string): Promise<Captio
   const videoId = extractYoutubeId(inputUrl);
   if (!videoId) throw new Error('Invalid YouTube video URL');
 
-  // Prefer YouTube's internal API through YouTube.js. This avoids making the public
-  // watch-page HTML request the single point of failure on cloud-hosted IP ranges.
+  let innerResult: CaptionResult | null = null;
+  let innerError: unknown = null;
   try {
-    return await fetchViaInnertube(videoId);
-  } catch (innerError) {
-    try {
-      return await fetchViaWatchPage(videoId);
-    } catch (pageError) {
-      const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
-      const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
-      throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
+    innerResult = await fetchViaInnertube(videoId);
+    if (innerResult.transcript) return innerResult;
+  } catch (error) {
+    innerError = error;
+  }
+
+  try {
+    const pageResult = await fetchViaWatchPage(videoId);
+    if (pageResult.transcript) return pageResult;
+    return innerResult || pageResult;
+  } catch (pageError) {
+    if (pageError instanceof CaptionAccessError) {
+      console.error(`[youtube-captions-page] video=${videoId}`, pageError.diagnostics);
     }
+    if (innerError instanceof CaptionAccessError || pageError instanceof CaptionAccessError) {
+      throw new Error(`YouTube captions were detected but could not be fetched from this deployment.${proxyHint()}`);
+    }
+    if (innerResult) return innerResult;
+
+    const innerMessage = innerError instanceof Error ? innerError.message : String(innerError);
+    const pageMessage = pageError instanceof Error ? pageError.message : String(pageError);
+    throw new Error(`YouTube access failed. Internal API: ${innerMessage}. Watch-page fallback: ${pageMessage}`);
   }
 }
 
@@ -262,7 +349,7 @@ export async function fetchAudioFormat(videoUrl: string) {
   // YouTube increasingly applies different playback requirements to different InnerTube
   // clients. A normal WEB metadata request can succeed while its streamingData is omitted.
   // Retry a small set of official clients before treating the video as non-downloadable.
-  const clients = ['WEB', 'ANDROID_VR', 'IOS', 'TV', 'WEB_EMBEDDED'] as const;
+  const clients = ['IOS', 'ANDROID_VR', 'TV', 'WEB_EMBEDDED', 'WEB'] as const;
   const failures: string[] = [];
 
   for (const client of clients) {
@@ -286,7 +373,8 @@ export async function fetchAudioFormat(videoUrl: string) {
     }
   }
 
-  throw new Error(`No downloadable YouTube audio stream was available. ${failures.join(' | ')}`);
+  console.error(`[youtube-audio] video=${videoId}`, failures);
+  throw new Error(`YouTube did not provide a downloadable audio stream to this deployment.${proxyHint()}`);
 }
 
 function walkForPlaylistIds(node: unknown, out: string[]) {
@@ -320,7 +408,7 @@ async function expandPlaylistWithInnertube(listId: string) {
 
 async function expandPlaylistFromPage(listId: string) {
   const playlistUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}&hl=en`;
-  const res = await fetch(playlistUrl, { headers: requestHeaders(), cache: 'no-store' });
+  const res = await youtubeFetch(playlistUrl, { headers: requestHeaders(), cache: 'no-store' });
   if (!res.ok) throw new Error(`Playlist fetch returned HTTP ${res.status}`);
   const html = await res.text();
   const initial = extractAssignedJson(html, 'ytInitialData');

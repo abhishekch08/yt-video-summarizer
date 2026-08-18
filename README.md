@@ -29,6 +29,7 @@ A private, mobile-first YouTube summarizer designed for Vercel Hobby + Supabase 
 - `gpt-5-nano` for cheap content classification
 - `gpt-4o-mini-transcribe` for audio fallback
 - `youtubei.js` + bundled `ffmpeg-static` for chunked audio extraction
+- optional authenticated proxy egress for cloud IPs that YouTube restricts
 
 ## 1. Create Supabase project
 
@@ -79,11 +80,30 @@ Use the Cookie header from a YouTube/Google account that is already authorized t
 
 Important: no application can access a private/member video if the YouTube account represented by the cookie is not authorized to view it. YouTube can also block cloud-hosted extraction traffic or change undocumented interfaces; the app reports these failures rather than hiding them.
 
+### Vercel / cloud egress
+
+YouTube can advertise a caption track or return video metadata while withholding the
+caption body and media streams from a cloud-hosted IP. If that happens, configure a
+trusted HTTP(S) proxy whose egress can reach YouTube:
+
+```text
+YOUTUBE_PROXY_URL=http://username:password@proxy-host:port
+```
+
+The same proxy is used for player metadata, captions, playlists, and FFmpeg audio
+requests. Store it only in Vercel environment variables. The app redacts the proxy and
+signed media URLs from user-facing conversion errors.
+
+For reliable production use, use a private authenticated proxy. Public/free proxies are
+not appropriate because transcripts, cookies, and signed media requests would pass
+through that operator.
+
 ## 4. Deploy on Vercel
 
 1. Push this folder to a GitHub repository.
 2. In Vercel choose **Add New → Project** and import that repository.
 3. Add all required variables from `.env.example` under **Project Settings → Environment Variables**.
+   Add `YOUTUBE_PROXY_URL` as well if Vercel's direct egress is restricted by YouTube.
 4. Enable **Fluid Compute** for the project if it is not already enabled.
 5. Deploy.
 
