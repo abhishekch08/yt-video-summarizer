@@ -7,6 +7,11 @@ import { saveTranscript } from '@/lib/video-store';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
+type TranscriptChunkRow = {
+  chunk_index: number;
+  text: string;
+};
+
 export async function POST(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const auth = await requireAuth();
   if (auth) return auth;
@@ -15,7 +20,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
     const { data, error } = await db().from('transcript_chunks').select('chunk_index,text').eq('video_id', id).order('chunk_index');
     if (error) throw error;
     if (!data?.length) throw new Error('No transcribed chunks were found.');
-    const transcript = cleanTranscript(data.map((row) => row.text));
+    const transcript = cleanTranscript((data as TranscriptChunkRow[]).map((row) => row.text));
     if (!transcript) throw new Error('Combined transcription was empty.');
     await saveTranscript(id, transcript, 'audio');
     const { error: deleteError } = await db().from('transcript_chunks').delete().eq('video_id', id);
